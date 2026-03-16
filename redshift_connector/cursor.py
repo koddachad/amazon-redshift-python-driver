@@ -331,6 +331,9 @@ class Cursor:
         self._SHOW_PARAMETERS_FUNC_Col_index: typing.Optional[typing.Dict[str, int]] = None
 
         self._TABLE_TYPE_LIST:typing.List[typing.Tuple] = [("EXTERNAL TABLE",), ("EXTERNAL VIEW",), ("LOCAL TEMPORARY",), ("TABLE",), ("VIEW",)]
+        self.streaming: bool = False
+        self._streaming_mode: bool = False
+        self._streaming_done: bool = False
 
         # The minimum show discovery version with prepare support for the following metadata api was version 4:
         # get_catalogs, get_schemas, get_tables, get_columns,
@@ -466,11 +469,25 @@ class Cursor:
             # execution.
             self.truncated_row_desc.cache_clear()
 
+            self._c.merge_socket_read = merge_socket_read
+
+            # The implicit "begin transaction" must ALWAYS run synchronously
+            # so its response messages are fully consumed before the real
+            # statement executes.  Set _streaming_mode = False for it.
+            self._streaming_mode = False
+            self._streaming_done = False
+
             # For Redshift, we need to begin transaction and then to process query
             # In the end we can use commit or rollback to end the transaction
             if not self._c.in_transaction and not self._c.autocommit:
                 self._c.execute(self, "begin transaction", None)
-            self._c.merge_socket_read = merge_socket_read
+
+            # Now set streaming mode based on the actual statement.
+            # Only SELECT/WITH return rows and benefit from streaming.
+            stripped = operation.lstrip().upper()
+            is_select = stripped.startswith("SELECT") or stripped.startswith("WITH")
+            self._streaming_mode = self.streaming and is_select
+
             self._c.execute(self, operation, args)
         except Exception as e:
             try:
@@ -696,13 +713,29 @@ class Cursor:
         This method is part of the `DBAPI 2.0 specification
         <http://www.python.org/dev/peps/pep-0249/>`_.
 
-        A row as a sequence of field values, or ``None`` if no more rows
-            are available.
+        If a streaming query is still in progress, this transparently
+        closes the old socket and reconnects to the server so the
+        connection is immediately usable for new queries.  This is
+        equivalent to what the V1 ODBC driver did with SingleRowMode.
 
         Returns
         -------
         None:None
         """
+        if self._streaming_mode and not self._streaming_done and self._c is not None and self._c._sock is not None:
+            # A streaming query is still in progress.  The socket has an
+            # unknown (potentially huge) number of unread DataRow messages.
+            # Rather than draining them — which would be as slow as reading
+            # the full result set — close the TCP socket and reconnect.
+            # This is instant regardless of result set size.
+            try:
+                self._c._active_streaming_cursor = None
+                self._c._reconnect()
+            except Exception:
+                pass
+            self._streaming_mode = False
+            self._streaming_done = True
+            self._cached_rows.clear()
         self._c = None
 
     def __iter__(self: "Cursor") -> "Cursor":
@@ -734,6 +767,21 @@ class Cursor:
                 raise ProgrammingError("A query hasn't been issued.")
             elif len(self.ps["row_desc"]) == 0:
                 raise ProgrammingError("no result set")
+            elif self._streaming_mode and not self._streaming_done and self._c is not None and self._c._sock is not None:
+                # Streaming mode: read messages one at a time from the socket
+                # until we get a row or the result set is complete.
+                # Reading one message per __next__ call means fetchmany(n)
+                # reads exactly n rows from the socket — no more — so the
+                # TCP receive buffer never fills up and the connection never stalls.
+                while not self._cached_rows:
+                    more = self._c.handle_messages_streaming(self)
+                    if not more:
+                        self._streaming_done = True
+                        self._streaming_mode = False
+                        if self._c is not None:
+                            self._c._active_streaming_cursor = None
+                        raise StopIteration()
+                return self._cached_rows.popleft()
             else:
                 raise StopIteration()
 

@@ -1,1 +1,5 @@
-
+build/
+dist/
+redshift_connector.egg-info/
+redshift_connector/__pycache__/
+redshift_connector/plugin/__pycache__/

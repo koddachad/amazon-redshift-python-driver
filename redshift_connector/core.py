@@ -496,6 +496,38 @@ class Connection:
         session_token: Optional[str]
             The AWS session token for identity-enhanced credentials flow with IdpTokenAuthPlugin.
         """
+        # Save all __init__ kwargs so _reconnect() can create a fresh connection.
+        self._init_kwargs: typing.Dict[str, typing.Any] = {
+            "user": user,
+            "password": password,
+            "database": database,
+            "host": host,
+            "port": port,
+            "source_address": source_address,
+            "unix_sock": unix_sock,
+            "ssl": ssl,
+            "sslmode": sslmode,
+            "timeout": timeout,
+            "max_prepared_statements": max_prepared_statements,
+            "tcp_keepalive": tcp_keepalive,
+            "tcp_keepalive_idle": tcp_keepalive_idle,
+            "tcp_keepalive_interval": tcp_keepalive_interval,
+            "tcp_keepalive_count": tcp_keepalive_count,
+            "application_name": application_name,
+            "client_protocol_version": client_protocol_version,
+            "database_metadata_current_db_only": database_metadata_current_db_only,
+            "credentials_provider": credentials_provider,
+            "provider_name": provider_name,
+            "web_identity_token": web_identity_token,
+            "numeric_to_float": numeric_to_float,
+            "identity_namespace": identity_namespace,
+            "token_type": token_type,
+            "idc_client_display_name": idc_client_display_name,
+            "access_key_id": access_key_id,
+            "secret_access_key": secret_access_key,
+            "session_token": session_token,
+        }
+
         self.merge_socket_read = True
 
         _client_encoding = "utf8"
@@ -615,6 +647,11 @@ class Connection:
 
         self.autocommit: bool = False
         self._xid = None
+
+        # Store connection target so we can open a cancel socket later
+        self._host: typing.Optional[str] = host
+        self._port: int = port
+        self._unix_sock: typing.Optional[str] = unix_sock
 
         self._caches: typing.Dict = {}
 
@@ -737,6 +774,7 @@ class Connection:
         self._read: typing.Callable = self._sock.read
         self._write: typing.Callable = self._sock.write
         self._backend_key_data: typing.Optional[bytes] = None
+        self._active_streaming_cursor: typing.Optional["Cursor"] = None
 
         trans_tab = dict(zip(map(ord, "{}"), "[]"))
         glbls = {"Decimal": Decimal}
@@ -1269,6 +1307,149 @@ class Connection:
             self._usock.close()
             self._sock = None  # type: ignore
 
+    def cancel(self: "Connection") -> None:
+        """
+        Sends a CancelRequest message to the server on a new connection.
+
+        The server will interrupt the currently-running query on this connection,
+        stop sending data rows, and respond with an ErrorResponse followed by
+        ReadyForQuery on the original socket.
+
+        CancelRequest (F)
+            Int32(16)   - Message length, including self.
+            Int32(80877102) - The cancel request code (1234 << 16 | 5678).
+            Int32       - The process ID (from BackendKeyData).
+            Int32       - The secret key (from BackendKeyData).
+        """
+        if self._backend_key_data is None:
+            raise InterfaceError("Cannot cancel: no backend key data received")
+
+        _logger.debug("Sending CancelRequest to server")
+        # BackendKeyData is 8 bytes: 4-byte process ID + 4-byte secret key
+        cancel_msg = ii_pack(16, 80877102) + self._backend_key_data
+
+        cancel_sock = None
+        try:
+            if self._unix_sock is not None:
+                cancel_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                cancel_sock.connect(self._unix_sock)
+            elif self._host is not None:
+                hostport = Connection.__get_host_address_info(self._host, self._port)
+                cancel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                cancel_sock.settimeout(5)
+                cancel_sock.connect(hostport)
+            else:
+                raise InterfaceError("Cannot cancel: no host or unix socket available")
+
+            cancel_sock.sendall(cancel_msg)
+        finally:
+            if cancel_sock is not None:
+                cancel_sock.close()
+
+    def _drain_until_ready(self: "Connection") -> None:
+        """
+        Fast-drain the socket until ReadyForQuery (b'Z') is received.
+
+        Reads large chunks directly from the raw socket into a buffer and
+        scans for message boundaries using only the 5-byte header (code +
+        length).  Message bodies are skipped without parsing.  This is
+        orders of magnitude faster than handle_messages for large result
+        sets because there is no per-row Python object creation, and
+        reading in large chunks (64 KB) amortizes syscall overhead.
+
+        After a CancelRequest the server will eventually send an
+        ErrorResponse followed by ReadyForQuery.  Any DataRow messages
+        already in the TCP pipeline are discarded along the way.
+
+        The buffered file object (self._sock) is discarded and recreated
+        afterward so its internal buffer does not hold stale bytes.
+        """
+        _logger.debug("Fast-draining socket until ReadyForQuery")
+
+        CHUNK_SIZE = 65536
+        buf = bytearray()
+
+        def _ensure(n: int) -> None:
+            """Ensure buf contains at least *n* bytes, reading from socket."""
+            while len(buf) < n:
+                data = self._usock.recv(CHUNK_SIZE)
+                if not data:
+                    raise InterfaceError(
+                        "BrokenPipe: server socket closed during drain."
+                    )
+                buf.extend(data)
+
+        while True:
+            # Read 5-byte message header: 1 byte code + 4 byte length
+            _ensure(5)
+            code = bytes(buf[0:1])
+            data_len = int.from_bytes(buf[1:5], byteorder="big")
+            msg_total = 1 + data_len  # code byte + length field + body
+
+            # Read the full message so we can discard it
+            _ensure(msg_total)
+            del buf[:msg_total]
+
+            if code == READY_FOR_QUERY:
+                _logger.debug("ReadyForQuery received during drain")
+                break
+
+        # Recreate the buffered file object so it starts clean.
+        # Any leftover bytes in buf belong to the next exchange — but
+        # after ReadyForQuery the server is idle, so buf should be empty.
+        self._sock = self._usock.makefile(mode="rwb")
+        self._flush = self._sock.flush
+        self._read = self._sock.read
+        self._write = self._sock.write
+
+        # Clear any error set by the ErrorResponse from the cancel.
+        self.error = None
+
+    def _reconnect(self: "Connection") -> None:
+        """
+        Tear down the current socket and establish a fresh connection to
+        the same Redshift server using the original connection parameters.
+
+        This is used when a streaming cursor is closed early — the socket
+        is poisoned with unread DataRow messages that cannot be drained
+        quickly, so the fastest path to a clean connection is to close
+        the TCP socket (instant) and open a new one (typically < 1 second
+        including SSL handshake and authentication).
+
+        All internal state (message_types, prepared-statement cache, etc.)
+        is preserved because only the socket layer is replaced.
+        """
+        _logger.debug("Reconnecting: closing old socket and establishing new connection")
+
+        # 1. Kill the old socket immediately — no Terminate message, just
+        #    slam the TCP connection shut.  The server will notice the RST
+        #    and clean up on its side.
+        try:
+            if self._sock is not None:
+                self._sock.close()
+            self._usock.close()
+        except Exception:
+            pass
+        self._sock = None  # type: ignore
+
+        # 2. Build a fresh Connection with the saved kwargs and steal its
+        #    socket + auth state.
+        fresh = Connection(**self._init_kwargs)
+
+        self._usock = fresh._usock
+        self._sock = fresh._sock
+        self._flush = fresh._flush
+        self._read = fresh._read
+        self._write = fresh._write
+        self._backend_key_data = fresh._backend_key_data
+        self.parameter_statuses = fresh.parameter_statuses
+        self.in_transaction = False
+        self.error = None
+
+        # Clear prepared statement cache — the new server session knows
+        # nothing about previously prepared statements.
+        self._caches = {}
+
     def handle_AUTHENTICATION_REQUEST(self: "Connection", data: bytes, cursor: Cursor) -> None:
         """
         Handler for AuthenticationRequest message received via Amazon Redshift wire protocol, represented by
@@ -1668,6 +1849,18 @@ class Connection:
         """
         _logger.debug("Connection.execute()")
 
+        # If a cursor is actively streaming on this connection (even this
+        # same cursor re-executing), reconnect so the socket is clean.
+        if self._active_streaming_cursor is not None:
+            streaming_cursor = self._active_streaming_cursor
+            if streaming_cursor._streaming_mode and not streaming_cursor._streaming_done:
+                _logger.debug("Closing active streaming cursor before new execute")
+                self._active_streaming_cursor = None
+                streaming_cursor._streaming_mode = False
+                streaming_cursor._streaming_done = True
+                streaming_cursor._cached_rows.clear()
+                self._reconnect()
+
         # get the process ID of the calling process.
         pid: int = getpid()
 
@@ -1894,7 +2087,11 @@ class Connection:
         self._flush()
         # handle multi messages including BIND_COMPLETE, DATA_ROW, COMMAND_COMPLETE
         # READY_FOR_QUERY
-        if self.merge_socket_read:
+        # When _streaming_mode is True, __next__ drives socket reads on demand
+        # via handle_messages_streaming so rows are never all buffered at once.
+        if getattr(cursor, '_streaming_mode', False):
+            self._active_streaming_cursor = cursor
+        elif self.merge_socket_read:
             self.handle_messages_merge_socket_read(cursor)
         else:
             self.handle_messages(cursor)
@@ -2155,6 +2352,39 @@ class Connection:
 
         if self.error is not None:
             raise self.error
+
+    def handle_messages_streaming(self: "Connection", cursor: Cursor) -> bool:
+        """
+        Read exactly one message from the server and process it.
+
+        Returns True if more messages are expected, False when
+        READY_FOR_QUERY is received (result set complete).
+
+        Called once per row by Cursor.__next__ in streaming mode so that
+        fetchmany(n) reads exactly n rows from the socket and no more.
+        This prevents the TCP receive buffer from filling up and stalling
+        the connection mid-result-set.
+        """
+        buffer = self._read(5)
+        if len(buffer) == 0:
+            if self._usock.timeout is not None:
+                raise InterfaceError(
+                    "BrokenPipe: server socket closed. We noticed a timeout is set "
+                    "for this connection. Consider raising the timeout or defaulting "
+                    "timeout to none."
+                )
+            else:
+                raise InterfaceError(
+                    "BrokenPipe: server socket closed. Please check that client side "
+                    "networking configurations such as Proxies, firewalls, VPN, etc. "
+                    "are not affecting your network connection."
+                )
+        code, data_len = ci_unpack(buffer)
+        _logger.debug("Message received from BE with code %s length %s", code, data_len)
+        self.message_types[code](self._read(data_len - 4), cursor)
+        if self.error is not None:
+            raise self.error
+        return code != READY_FOR_QUERY
 
     def close_prepared_statement(self: "Connection", statement_name_bin: bytes) -> None:
         """
