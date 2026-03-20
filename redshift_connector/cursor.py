@@ -332,6 +332,7 @@ class Cursor:
 
         self._TABLE_TYPE_LIST:typing.List[typing.Tuple] = [("EXTERNAL TABLE",), ("EXTERNAL VIEW",), ("LOCAL TEMPORARY",), ("TABLE",), ("VIEW",)]
         self.streaming: bool = False
+        self.streaming_batch_size: int = 1
         self._streaming_mode: bool = False
         self._streaming_done: bool = False
 
@@ -416,7 +417,30 @@ class Cursor:
             except UnicodeError:
                 warn("failed to decode column name: {}, reverting to bytes".format(col["label"]))  # type: ignore
                 col_name = typing.cast(bytes, col["label"])
-            columns.append((col_name, col["type_oid"], None, None, None, None, None))
+
+            type_oid: int = col["type_oid"]
+            type_size: int = col.get("type_size", -1)
+            type_modifier: int = col.get("type_modifier", -1)
+            nullable: typing.Optional[bool] = col.get("nullable")
+
+            display_size: typing.Optional[int] = None
+            internal_size: typing.Optional[int] = type_size if type_size > 0 else None
+            precision: typing.Optional[int] = None
+            scale: typing.Optional[int] = None
+
+            if type_modifier != -1:
+                mod: int = type_modifier - 4
+                if type_oid == 1700:
+                    # NUMERIC/DECIMAL: upper 16 bits = precision, lower 16 bits = scale
+                    precision = (mod >> 16) & 0xFFFF
+                    scale = mod & 0xFFFF
+                    display_size = precision + 2  # sign + decimal point
+                elif type_oid in (1042, 1043, 6551):
+                    # CHAR (1042), VARCHAR (1043), VARBYTE (6551): mod = max length
+                    display_size = mod
+                    internal_size = mod
+
+            columns.append((col_name, type_oid, display_size, internal_size, precision, scale, nullable))
         return columns
 
     ##
@@ -482,11 +506,12 @@ class Cursor:
             if not self._c.in_transaction and not self._c.autocommit:
                 self._c.execute(self, "begin transaction", None)
 
-            # Now set streaming mode based on the actual statement.
-            # Only SELECT/WITH return rows and benefit from streaming.
-            stripped = operation.lstrip().upper()
-            is_select = stripped.startswith("SELECT") or stripped.startswith("WITH")
-            self._streaming_mode = self.streaming and is_select
+            # Enable streaming mode if the user opted in.  The connection's
+            # execute() will eagerly read protocol messages until it sees
+            # ROW_DESCRIPTION (rows are coming — switch to lazy streaming)
+            # or READY_FOR_QUERY (no result set — done).  This avoids
+            # fragile SQL parsing to guess whether the statement returns rows.
+            self._streaming_mode = getattr(self, "streaming", False)
 
             self._c.execute(self, operation, args)
         except Exception as e:
@@ -730,6 +755,7 @@ class Cursor:
             # This is instant regardless of result set size.
             try:
                 self._c._active_streaming_cursor = None
+                self._c._streaming_header = None
                 self._c._reconnect()
             except Exception:
                 pass
@@ -768,19 +794,26 @@ class Cursor:
             elif len(self.ps["row_desc"]) == 0:
                 raise ProgrammingError("no result set")
             elif self._streaming_mode and not self._streaming_done and self._c is not None and self._c._sock is not None:
-                # Streaming mode: read messages one at a time from the socket
-                # until we get a row or the result set is complete.
-                # Reading one message per __next__ call means fetchmany(n)
-                # reads exactly n rows from the socket — no more — so the
-                # TCP receive buffer never fills up and the connection never stalls.
-                while not self._cached_rows:
+                # Streaming mode: read up to streaming_batch_size rows from
+                # the socket to amortize syscall overhead.  When batch_size
+                # is 1 (the default) this behaves exactly as before — one
+                # message per __next__ call.  Larger values let fetchmany(n)
+                # benefit from bulk socket reads while still bounding memory.
+                rows_read: int = 0
+                while rows_read < self.streaming_batch_size:
                     more = self._c.handle_messages_streaming(self)
                     if not more:
                         self._streaming_done = True
                         self._streaming_mode = False
                         if self._c is not None:
                             self._c._active_streaming_cursor = None
-                        raise StopIteration()
+                            self._c._streaming_header = None
+                        break
+                    # Only count DATA_ROW messages (ones that actually added a row)
+                    if self._cached_rows:
+                        rows_read = len(self._cached_rows)
+                if not self._cached_rows:
+                    raise StopIteration()
                 return self._cached_rows.popleft()
             else:
                 raise StopIteration()

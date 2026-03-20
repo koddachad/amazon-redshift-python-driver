@@ -435,6 +435,7 @@ class Connection:
         access_key_id: typing.Optional[str] = None,
         secret_access_key: typing.Optional[str] = None,
         session_token: typing.Optional[str] = None,
+        socket_buffer_size: typing.Optional[int] = None,
     ):
         """
         Creates a :class:`Connection` to an Amazon Redshift cluster. For more information on establishing a connection to an Amazon Redshift cluster using `federated API access <https://aws.amazon.com/blogs/big-data/federated-api-access-to-amazon-redshift-using-an-amazon-redshift-connector-for-python/>`_ see our examples page.
@@ -526,6 +527,7 @@ class Connection:
             "access_key_id": access_key_id,
             "secret_access_key": secret_access_key,
             "session_token": session_token,
+            "socket_buffer_size": socket_buffer_size,
         }
 
         self.merge_socket_read = True
@@ -728,7 +730,10 @@ class Connection:
                 except ImportError:
                     raise InterfaceError("SSL required but ssl module not available in this Python installation")
 
-            self._sock = self._usock.makefile(mode="rwb")
+            if socket_buffer_size is not None:
+                self._sock = self._usock.makefile(mode="rwb", buffering=socket_buffer_size)
+            else:
+                self._sock = self._usock.makefile(mode="rwb")
             if tcp_keepalive:
                 _logger.debug("enabling tcp keepalive on socket")
                 self._usock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -775,6 +780,8 @@ class Connection:
         self._write: typing.Callable = self._sock.write
         self._backend_key_data: typing.Optional[bytes] = None
         self._active_streaming_cursor: typing.Optional["Cursor"] = None
+        self._streaming_header: typing.Optional[bytes] = None
+        self._streaming_pending_header: typing.Optional[bytes] = None
 
         trans_tab = dict(zip(map(ord, "{}"), "[]"))
         glbls = {"Decimal": Decimal}
@@ -1753,11 +1760,13 @@ class Connection:
 
         # If a cursor is actively streaming on this connection (even this
         # same cursor re-executing), reconnect so the socket is clean.
-        if self._active_streaming_cursor is not None:
+        if getattr(self, "_active_streaming_cursor", None) is not None:
             streaming_cursor = self._active_streaming_cursor
             if streaming_cursor._streaming_mode and not streaming_cursor._streaming_done:
                 _logger.debug("Closing active streaming cursor before new execute")
                 self._active_streaming_cursor = None
+                self._streaming_header = None
+                self._streaming_pending_header = None
                 streaming_cursor._streaming_mode = False
                 streaming_cursor._streaming_done = True
                 streaming_cursor._cached_rows.clear()
@@ -1989,18 +1998,26 @@ class Connection:
         self._flush()
         # handle multi messages including BIND_COMPLETE, DATA_ROW, COMMAND_COMPLETE
         # READY_FOR_QUERY
-        # When _streaming_mode is True, __next__ drives socket reads on demand
-        # via handle_messages_streaming so rows are never all buffered at once.
-        if getattr(cursor, '_streaming_mode', False):
-            self._active_streaming_cursor = cursor
+        if getattr(cursor, '_streaming_mode', False) is True:
+            # Streaming requested: read messages eagerly until we see
+            # the first DATA_ROW (rows are coming) or READY_FOR_QUERY
+            # (no result set).  This lets the server — not SQL parsing
+            # — decide whether the statement returns rows.
+            self._handle_messages_until_streaming(cursor)
         elif self.merge_socket_read:
             self.handle_messages_merge_socket_read(cursor)
         else:
             self.handle_messages(cursor)
 
-        # Clean up prepared statements after query execution and results are returned
-        for stmt in statements_to_close:
-            self.close_prepared_statement(stmt)
+        # Clean up prepared statements after query execution and results are returned.
+        # When streaming is active, the socket has unread DATA_ROW messages —
+        # sending Close now would cause handle_messages() to drain all rows
+        # into memory.  Defer cleanup until the streaming cursor finishes or
+        # is closed, at which point the connection reconnects anyway (clearing
+        # all server-side prepared statement state).
+        if getattr(cursor, '_streaming_mode', False) is not True:
+            for stmt in statements_to_close:
+                self.close_prepared_statement(stmt)
 
     def _send_message(self: "Connection", code: bytes, data: bytes) -> None:
         _logger.debug("Sending message with code %s to BE", code)
@@ -2156,7 +2173,8 @@ class Connection:
         -------
         None:None
         """
-        _logger.debug("DataRow message received from BE")
+        if _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug("DataRow message received from BE")
         data_idx: int = 2
         row: typing.List = []
         for desc in cursor.truncated_row_desc():
@@ -2203,7 +2221,8 @@ class Connection:
                     )
 
             code, data_len = ci_unpack(buffer)
-            _logger.debug("Message received from BE with code %s length %s ", code, data_len)
+            if _logger.isEnabledFor(logging.DEBUG):
+                _logger.debug("Message received from BE with code %s length %s ", code, data_len)
             self.message_types[code](self._read(data_len - 4), cursor)
 
         if self.error is not None:
@@ -2240,7 +2259,8 @@ class Connection:
         code, data_len = ci_unpack(buffer)
 
         while True:
-            _logger.debug("Message received from BE with code %s length %s ", code, data_len)
+            if _logger.isEnabledFor(logging.DEBUG):
+                _logger.debug("Message received from BE with code %s length %s ", code, data_len)
             if code == READY_FOR_QUERY:
                 # for last message
                 self.message_types[code](self._read(data_len - 4), cursor)
@@ -2255,20 +2275,89 @@ class Connection:
         if self.error is not None:
             raise self.error
 
+    def _handle_messages_until_streaming(self: "Connection", cursor: Cursor) -> None:
+        """
+        Read messages eagerly until the first DATA_ROW or READY_FOR_QUERY.
+
+        In the extended query protocol the Bind/Execute response sequence
+        is: BIND_COMPLETE, DATA_ROW…, COMMAND_COMPLETE, READY_FOR_QUERY.
+        There is no ROW_DESCRIPTION in this sequence (it arrives earlier,
+        during Parse/Describe).
+
+        If DATA_ROW is received, the statement returns rows.  The row is
+        already appended to ``cursor._cached_rows`` by ``handle_DATA_ROW``.
+        We register the cursor for lazy streaming and return — subsequent
+        rows will be read on demand by ``handle_messages_streaming()``.
+
+        If READY_FOR_QUERY is received first, the statement does not
+        return rows (e.g. INSERT, CREATE).  We disable streaming mode
+        on the cursor so it behaves like a non-streaming execution.
+        """
+        while True:
+            buffer = self._read(5)
+            if len(buffer) == 0:
+                if self._usock.timeout is not None:
+                    raise InterfaceError(
+                        "BrokenPipe: server socket closed. We noticed a timeout is set "
+                        "for this connection. Consider raising the timeout or defaulting "
+                        "timeout to none."
+                    )
+                else:
+                    raise InterfaceError(
+                        "BrokenPipe: server socket closed. Please check that client side "
+                        "networking configurations such as Proxies, firewalls, VPN, etc. "
+                        "are not affecting your network connection."
+                    )
+
+            code, data_len = ci_unpack(buffer)
+
+            if code == DATA_ROW:
+                # First row received — switch to lazy streaming.
+                # Don't decode the row here; stash the raw header so
+                # handle_messages_streaming() can read and process it
+                # on the first __next__() call.
+                self._streaming_pending_header = buffer
+                self._active_streaming_cursor = cursor
+                return
+
+            self.message_types[code](self._read(data_len - 4), cursor)
+
+            if self.error is not None:
+                raise self.error
+
+            if code == READY_FOR_QUERY:
+                # No result set — disable streaming, nothing to iterate.
+                cursor._streaming_mode = False
+                cursor._streaming_done = True
+                return
+
     def handle_messages_streaming(self: "Connection", cursor: Cursor) -> bool:
         """
-        Read exactly one message from the server and process it.
+        Read one message from the server and process it.
 
         Returns True if more messages are expected, False when
         READY_FOR_QUERY is received (result set complete).
 
-        Called once per row by Cursor.__next__ in streaming mode so that
-        fetchmany(n) reads exactly n rows from the socket and no more.
-        This prevents the TCP receive buffer from filling up and stalling
-        the connection mid-result-set.
+        Uses a merged-read strategy: each call reads the current message body
+        together with the next message's 5-byte header in a single ``_read()``,
+        stashing the header in ``_streaming_header`` for the next call.  This
+        halves the number of socket reads compared to reading header and body
+        separately.
         """
-        buffer = self._read(5)
-        if len(buffer) == 0:
+        # Obtain the 5-byte header: either stashed from the previous call's
+        # merged read, pending from _handle_messages_until_streaming()
+        # (first DATA_ROW), or read fresh from the socket.
+        header: typing.Optional[bytes] = self._streaming_header
+        if header is not None:
+            self._streaming_header = None
+        else:
+            header = getattr(self, '_streaming_pending_header', None)
+            if header is not None:
+                self._streaming_pending_header = None
+            else:
+                header = self._read(5)
+
+        if len(header) == 0:
             if self._usock.timeout is not None:
                 raise InterfaceError(
                     "BrokenPipe: server socket closed. We noticed a timeout is set "
@@ -2281,9 +2370,19 @@ class Connection:
                     "networking configurations such as Proxies, firewalls, VPN, etc. "
                     "are not affecting your network connection."
                 )
-        code, data_len = ci_unpack(buffer)
-        _logger.debug("Message received from BE with code %s length %s", code, data_len)
-        self.message_types[code](self._read(data_len - 4), cursor)
+
+        code, data_len = ci_unpack(header)
+        body_len: int = data_len - 4
+
+        if code == READY_FOR_QUERY:
+            # Last message — no next header to read ahead.
+            self.message_types[code](self._read(body_len), cursor)
+        else:
+            # Merge: read current body + next 5-byte header in one read.
+            data = self._read(body_len + 5)
+            self.message_types[code](data[:body_len], cursor)
+            self._streaming_header = data[body_len:]
+
         if self.error is not None:
             raise self.error
         return code != READY_FOR_QUERY

@@ -184,6 +184,7 @@ def connect(
     issuer_url: typing.Optional[str] = None,
     token: typing.Optional[str] = None,
     token_type: typing.Optional[str] = None,
+    socket_buffer_size: typing.Optional[int] = None,
 ) -> Connection:
     """
     Establishes a :class:`Connection` to an Amazon Redshift cluster. This function validates user input, optionally authenticates using an identity provider plugin, then constructs a :class:`Connection` object.
@@ -365,6 +366,7 @@ def connect(
     info.put("serverless_acct_id", serverless_acct_id)
     info.put("serverless_work_group", serverless_work_group)
     info.put("session_token", session_token)
+    info.put("socket_buffer_size", socket_buffer_size)
     info.put("source_address", source_address)
     info.put("ssl", ssl)
     info.put("ssl_insecure", ssl_insecure)
@@ -467,6 +469,7 @@ def connect(
         access_key_id=info.access_key_id,
         secret_access_key=info.secret_access_key,
         session_token=info.session_token,
+        socket_buffer_size=info.socket_buffer_size,
     )
 
 

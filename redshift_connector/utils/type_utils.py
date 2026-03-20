@@ -572,8 +572,8 @@ def geometryhex_recv(data: bytes, idx: int, length: int) -> str:
         return result.hex()
 
 
-def varbytehex_recv(data: bytes, idx: int, length: int) -> str:
-    return codecs_decode(data[idx : idx + length], "hex_codec").decode(_client_encoding)
+def varbytehex_recv(data: bytes, idx: int, length: int) -> bytes:
+    return codecs_decode(data[idx : idx + length], "hex_codec")
 
 
 # def inet_in(data: bytes, offset: int, length: int) -> typing.Union[IPv4Address, IPv6Address, IPv4Network, IPv6Network]:

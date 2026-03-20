@@ -3,3 +3,15 @@ dist/
 redshift_connector.egg-info/
 redshift_connector/__pycache__/
 redshift_connector/plugin/__pycache__/
+redshift_connector/auth/__pycache__/
+redshift_connector/utils/__pycache__/
+test/__pycache__/
+test/integration/__pycache__/
+test/unit/__pycache__/
+test/unit/auth/__pycache__/
+test/unit/datatype/__pycache__/
+test/unit/helpers/__pycache__/
+test/unit/mocks/__pycache__/
+test/unit/plugin/__pycache__/
+test/unit/plugin/data/__pycache__/
+test/utils/__pycache__/

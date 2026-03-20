@@ -117,6 +117,9 @@ class RedshiftProperty:
             self.tcp_keepalive_interval: typing.Optional[int] = None
             # Number of failed probes before connection is considered dead
             self.tcp_keepalive_count: typing.Optional[int] = None
+            # Size in bytes of the buffer used for socket reads via makefile().
+            # Defaults to Python's io.DEFAULT_BUFFER_SIZE (8192) when None.
+            self.socket_buffer_size: typing.Optional[int] = None
             # This is the time in seconds before the connection to the server will time out.
             self.timeout: typing.Optional[int] = None
             self.token: typing.Optional[str] = None
