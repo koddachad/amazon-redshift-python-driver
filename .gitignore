@@ -15,3 +15,6 @@ test/unit/mocks/__pycache__/
 test/unit/plugin/__pycache__/
 test/unit/plugin/data/__pycache__/
 test/utils/__pycache__/
+
+# cluster credentials for integration / manual tests
+test/config.ini
