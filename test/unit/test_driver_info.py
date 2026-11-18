@@ -12,7 +12,8 @@ def test_version_is_str() -> None:
 
 
 def test_version_proper_format() -> None:
-    version_regex: re.Pattern = re.compile(r"^\d+(\.\d+){2,3}$")
+    # Allow an optional PEP 440 post-release suffix (e.g. 2.2.0.post1) used by this fork.
+    version_regex: re.Pattern = re.compile(r"^\d+(\.\d+){2,3}(\.post\d+)?$")
     assert version_regex.match(DriverInfo.version())
 
 

@@ -1,6 +1,60 @@
 Changelog
 =========
 
+v2.2.0.post1 (2026-11-18) - fork
+--------------------------------
+- Merged upstream v2.2.0 into the streaming-cursor fork.
+- Fork feature: opt-in streaming cursor. Set ``cursor.streaming = True`` to read rows lazily from the socket instead of loading the full result set into memory. ``cursor.streaming_batch_size`` controls how many rows are read per fetch call.
+- Fork feature: closing a streaming cursor early, or executing a new statement while a stream is open, drops the socket and transparently reconnects using the original connection parameters instead of draining the unread rows.
+- Fork feature: added ``socket_buffer_size`` connection parameter to control the read buffer used for socket I/O.
+- Fork change: ``cursor.description`` now populates display_size, internal_size, precision, scale and null_ok from the row description.
+- Fork change: VARBYTE values are returned as ``bytes`` instead of a hex ``str``.
+- Fork fix: ``Connection._reconnect()`` now carries the upstream ``sslmode_defaulted`` and ``enable_table_types`` parameters so a reconnect behaves identically to the original connection.
+
+
+v2.2.0 (2026-10-09)
+-------------------
+- Behavior change: Changed the default value of sslmode from verify-ca to verify-full. In addition to validating the certificate chain, the driver now checks that the server certificate matches the host name it connected to. If sslmode is not set and the host name doesn't match, the driver logs a warning and still connects, so existing connections keep working while you migrate. If sslmode=verify-full is set explicitly, a mismatch still fails the connection. A future release will fail the connection on a mismatch in both cases.
+
+
+v2.1.17 (2026-09-21)
+-------------------
+- Improved the performance of the get_tables, get_columns, and get_table_privileges metadata APIs
+- Added an opt-in allowlist for credential provider plugin loading
+- Fixed an issue that occurred when multiple metadata API calls were made on the same connection
+
+
+v2.1.16 (2026-08-03)
+-------------------
+- Added enable_table_types connection option to generalize get_tables() table types to TABLE/VIEW when disabled
+- Added support for the default AWS credential provider chain in Identity Enhanced Credentials authentication.
+- Fixed get_procedure_columns() and get_function_columns() to return the correct LENGTH value for character-type parameters.
+- Fixed get_columns() to report TEXT columns as VARCHAR with size 256.
+
+
+v2.1.15 (2026-06-09)
+-------------------
+- Hardened identifier sanitization in callproc, write_dataframe, and metadata APIs to strip additional whitespace characters
+- Added driver_discovery_version parameter to the startup packet, enabling SHOW SCHEMAS to return pg_catalog in its results
+
+
+v2.1.14 (2026-05-18)
+-------------------
+- Raised minimum supported Python version from 3.7 to 3.8
+- Added support for pg_catalog internal data types in the getFunctionColumns and getProcedureColumns metadata APIs.
+- Addressed security issue as detailed in CVE-2026-41066
+- Addressed security issue as detailed in CVE-2026-8838
+
+
+v2.1.13 (2026-03-30)
+-------------------
+- Raised minimum supported Python version from 3.6 to 3.7
+- Fixed prepared statement cache desync causing KeyError after DDL/ROLLBACK
+- Raised lxml upper bound from <6.0.0 to <=6.0.2 to unblock Python 3.14 support
+- Bumped beautifulsoup4 minimum version from 4.7.0 to 4.13.5 to fix lxml 6.0 parsing bug with curly braces
+- Fixed Python 3.7/3.8 type hint compatibility in Metadata API
+
+
 v2.1.12 (2026-03-04)
 -------------------
 - Added support for Identity Enhanced Credentials authentication

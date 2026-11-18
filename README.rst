@@ -7,7 +7,7 @@ redshift_connector
 .. |PyPi| image:: https://img.shields.io/pypi/v/redshift_connector.svg?maxAge=432000&style=flat-square
    :target: https://pypi.org/project/redshift_connector/
 
-.. |Python Version| image:: https://img.shields.io/badge/python->=3.6-brightgreen.svg
+.. |Python Version| image:: https://img.shields.io/badge/python->=3.8-brightgreen.svg
    :target: https://pypi.org/project/redshift_connector/
 
 ``redshift_connector`` is the Amazon Redshift connector for
@@ -224,6 +224,69 @@ Alternatively, IAM credentials can be supplied directly to ``connect(...)`` usin
         session_token="my_aws_session_token",
         region="us-east-2"
      )
+
+Example using IdpTokenAuthPlugin with Default Credentials
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When using Identity Center (IdC) authentication, the ``IdpTokenAuthPlugin`` can automatically resolve
+AWS credentials from the environment (environment variables, ``~/.aws/credentials``, instance profile, etc.)
+without requiring explicit credential parameters:
+
+.. code-block:: python
+
+    import redshift_connector
+
+    # Connects using default credentials from the environment
+    conn = redshift_connector.connect(
+        host='my-cluster.abc123.us-east-1.redshift.amazonaws.com',
+        database='dev',
+        credentials_provider='IdpTokenAuthPlugin',
+    )
+
+The plugin resolves credentials via boto3's default credential chain and calls
+``GetIdentityCenterAuthToken`` to obtain a subject token for authentication.
+The cluster/workgroup identifier and region are extracted from the host URL.
+
+Example using IdpTokenAuthPlugin with Identity-Enhanced Credentials
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+You can provide explicit identity-enhanced AWS credentials (obtained via ``AssumeRole`` with
+an identity context from Identity Center). The plugin calls ``GetIdentityCenterAuthToken``
+with these credentials to obtain a subject token:
+
+.. code-block:: python
+
+    import redshift_connector
+
+    conn = redshift_connector.connect(
+        host='my-cluster.abc123.us-east-1.redshift.amazonaws.com',
+        database='dev',
+        credentials_provider='IdpTokenAuthPlugin',
+        access_key_id='my_access_key_id',
+        secret_access_key='my_secret_access_key',
+        session_token='my_session_token',
+    )
+
+Example using IdpTokenAuthPlugin with Direct Token
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If you already have a subject token (e.g., obtained from ``GetIdentityCenterAuthToken``),
+you can pass it directly without the plugin making additional API calls:
+
+.. code-block:: python
+
+    import redshift_connector
+
+    conn = redshift_connector.connect(
+        host='my-cluster.abc123.us-east-1.redshift.amazonaws.com',
+        database='dev',
+        credentials_provider='IdpTokenAuthPlugin',
+        token='<subject_token_from_GetIdentityCenterAuthToken>',
+        token_type='SUBJECT_TOKEN',
+    )
+
+.. note::
+
+    For clusters using Identity Center (IdC), the ``token`` must be a subject token
+    obtained from ``GetIdentityCenterAuthToken``. Raw external IdP tokens (e.g., Azure AD
+    JWTs) are not accepted directly by IdC-configured clusters.
 
 Integration with pandas
 ~~~~~~~~~~~~~~~~~~~~~~~

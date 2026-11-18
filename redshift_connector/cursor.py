@@ -342,6 +342,7 @@ class Cursor:
         # get_column_privileges, get_table_privileges,
         # get_procedures, get_procedure_columns, get_functions, get_function_columns
         self._MIN_SHOW_DISCOVERY_VERSION_V4: int = 4
+        self._MIN_SHOW_DISCOVERY_VERSION_V5: int = 5
 
         _logger.debug("Cursor.paramstyle=%s", self.paramstyle)
 
@@ -1177,7 +1178,15 @@ class Cursor:
         """
 
         self._check_connection()
-        table_types: typing.Tuple = self._metadataAPIPostProcessor.get_table_types_post_processing(self._TABLE_TYPE_LIST)
+        # Faithful to the SHOW-path-only scope of enable_table_types: only
+        # collapse to TABLE/VIEW when the option is disabled AND the cluster
+        # uses the server SHOW path. Legacy (pre-V4) clusters keep the full list.
+        if (not self._c.is_enable_table_types
+                and self.get_show_discovery_version() >= self._MIN_SHOW_DISCOVERY_VERSION_V4):
+            table_type_list = self._metadataAPIPostProcessor.GENERALIZED_TABLE_TYPE_LIST
+        else:
+            table_type_list = self._TABLE_TYPE_LIST
+        table_types: typing.Tuple = self._metadataAPIPostProcessor.get_table_types_post_processing(table_type_list)
 
         return table_types
 
@@ -1614,6 +1623,10 @@ class Cursor:
         A tuple where each row describes table privileges: tuple
         """
 
+        api_method = self._metadataServerProxy.get_table_privileges_v5 \
+            if self._can_use_batch_show() \
+            else self._metadataServerProxy.get_table_privileges
+
         return self._process_metadata_request(
             "get_table_privileges",
             self._MIN_SHOW_DISCOVERY_VERSION_V4,
@@ -1623,7 +1636,7 @@ class Cursor:
                 'table_name_pattern': table_name_pattern,
                 'is_single_database_metadata': self._c.is_single_database_metadata
             },
-            self._metadataServerProxy.get_table_privileges,
+            api_method,
             self._metadataAPIPostProcessor.get_table_privileges_post_processing,
             None,
             {'table_name_pattern': table_name_pattern}
@@ -1697,6 +1710,10 @@ class Cursor:
         if types is None:
             types = []
 
+        api_method = self._metadataServerProxy.get_tables_v5 \
+            if self._can_use_batch_show() \
+            else self._metadataServerProxy.get_tables
+
         return self._process_metadata_request(
             "get_tables",
             self._MIN_SHOW_DISCOVERY_VERSION_V4,
@@ -1706,7 +1723,7 @@ class Cursor:
                 'table_name_pattern':table_name_pattern,
                 'is_single_database_metadata': self._c.is_single_database_metadata
             },
-            self._metadataServerProxy.get_tables,
+            api_method,
             self._metadataAPIPostProcessor.get_tables_post_processing,
             self.get_tables_legacy_hardcoded_query,
             None,
@@ -2010,6 +2027,10 @@ class Cursor:
         A tuple where each row is a column description: tuple
         """
 
+        api_method = self._metadataServerProxy.get_columns_v5 \
+            if self._can_use_batch_show() \
+            else self._metadataServerProxy.get_columns
+
         return self._process_metadata_request(
             "get_columns",
             self._MIN_SHOW_DISCOVERY_VERSION_V4,
@@ -2020,7 +2041,7 @@ class Cursor:
                 'columnname_pattern':columnname_pattern,
                 'is_single_database_metadata': self._c.is_single_database_metadata
             },
-            self._metadataServerProxy.get_columns,
+            api_method,
             self._metadataAPIPostProcessor.get_columns_post_processing,
             self.get_columns_legacy_hardcoded_query
         )
@@ -3227,7 +3248,7 @@ class Cursor:
             return "NO_SCHEMA_UNIVERSAL_QUERY"
 
     def __sanitize_str(self: "Cursor", s: str) -> str:
-        return re.sub(r"[-;/'\"\n\r ]", "", s)
+        return re.sub(r"[-;/'\"\s]", "", s)
 
     def __escape_quotes(self: "Cursor", s: str) -> str:
         return "'{s}'".format(s=self.__sanitize_str(s))
@@ -3243,6 +3264,27 @@ class Cursor:
                     return 0
         _logger.debug("Cluster doesn't support SHOW. Return version number as 0")
         return 0
+
+    def _can_use_batch_show(self: "Cursor") -> bool:
+        """
+        Decides whether the batch SHOW ... FROM DATABASE path (V5) can be used.
+
+        Requires a server that supports the batch commands. Beyond that, the driver token only rules the
+        batch path out when the server sent a token we cannot use: a non-empty value that is not a
+        well-formed UUID would be sent in a DRIVER_TOKEN clause the server does not recognize, and the
+        batch command would be rejected. A server that sends no token at all is not gating batch SHOW, so
+        the batch path stays available and the DRIVER_TOKEN clause is simply omitted. Keeping the decision
+        that way means the batch path keeps working unchanged if the server later stops issuing tokens.
+        """
+        if self.get_show_discovery_version() < self._MIN_SHOW_DISCOVERY_VERSION_V5:
+            return False
+        if self._metadataServerProxy.has_malformed_driver_token():
+            _logger.debug(
+                "driver_token is not a well-formed UUID; falling back to loop-based SHOW commands instead "
+                "of batch SHOW. Metadata calls will be slower than expected."
+            )
+            return False
+        return True
 
     def _check_show_discovery_support(self, min_show_discovery: int, metadata_api_name: str, has_legacy_fallback: bool = False) -> bool:
         current_show_discovery_version: int = self.get_show_discovery_version()

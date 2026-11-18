@@ -74,7 +74,7 @@ class RedshiftDataTypes:
         'double precision', 'float8', 'float',
 
         # Character types
-        'char', 'character', 'nchar', 'bpchar',
+        'char', '"char"', 'character', 'nchar', 'bpchar',
         'varchar', 'character varying', 'nvarchar', 'text',
 
         # Date/Time types
@@ -85,6 +85,7 @@ class RedshiftDataTypes:
         'timestamptz', 'timestamp with time zone',
         'intervaly2m', 'interval year to month',
         'intervald2s', 'interval day to second',
+        'interval',
 
         # Other types
         'boolean', 'bool',
@@ -99,7 +100,39 @@ class RedshiftDataTypes:
         'smallint[]',
         'pg_attribute',
         'pg_type',
-        'refcursor'
+        'refcursor',
+
+        # pg_catalog pseudo-types
+        '"any"', '"trigger"', '"unknown"', 'anyelement', 'anyarray',
+        'record', 'void', 'opaque', 'language_handler',
+
+        # pg_catalog network/address types
+        'inet', 'cidr', 'macaddr',
+
+        # pg_catalog legacy time types
+        'abstime', 'reltime', 'tinterval',
+
+        # pg_catalog ACL and system catalog types
+        'aclitem', 'aclitem[]', 'oid[]', 'oidvector', 'int2vector',
+
+        # pg_catalog registration types
+        'regproc', 'regprocedure', 'regoper', 'regoperator', 'regclass', 'regtype',
+
+        # pg_catalog system/internal types
+        'smgr', 'tid', 'xid', 'cid', 'cstring',
+
+        # pg_catalog geometric types
+        'box', 'circle', 'line', 'lseg', '"path"', 'point', 'polygon',
+
+        # pg_catalog monetary/binary/misc types
+        'money', 'bit', 'bit varying', 'bytea', 'name',
+
+        # Redshift-specific internal types
+        'pyobject', 'roleitem', 'useritem',
+
+        # pg_catalog array types
+        'bigint[]', 'double precision[]', 'numeric[]',
+        'interval[]', 'intervaly2m[]', 'intervald2s[]',
     }
 
     @classmethod
@@ -108,7 +141,7 @@ class RedshiftDataTypes:
         return data_type.lower() in cls.VALID_TYPES
 
     @classmethod
-    def validate_types(cls, data_types: typing.List[str]) -> tuple[bool, typing.List[str]]:
+    def validate_types(cls, data_types: typing.List[str]) -> typing.Tuple[bool, typing.List[str]]:
         """
         Validate a list of Redshift data types against the predefined valid types.
 
@@ -125,7 +158,43 @@ class RedshiftDataTypes:
         return len(invalid_types) == 0, invalid_types
 
 
+# The server-generated driver_token is a UUID (36 characters). The token is embedded in the SQL as a
+# string literal because the server grammar does not accept a bind parameter in that position, so any
+# value that is not a well-formed UUID is rejected rather than concatenated. Matched with fullmatch()
+# rather than match(), since "$" would otherwise also accept a value with a trailing newline.
+_DRIVER_TOKEN_PATTERN: typing.Pattern = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
 class MetadataAPIHelper:
+    # Generalized list of table types reported by get_table_types() when
+    # enable_table_types is disabled. Ordered by TABLE_TYPE. Immutable so it
+    # cannot be modified unintentionally.
+    GENERALIZED_TABLE_TYPE_LIST: typing.Tuple[str, ...] = ("TABLE", "VIEW")
+
+    @staticmethod
+    def generalize_table_type(table_type):
+        """
+        Collapses a detailed SHOW TABLES table type into the generic bucket:
+        any value containing TABLE becomes TABLE, any value containing VIEW
+        becomes VIEW, otherwise the value is returned unchanged. Used when
+        enable_table_types is disabled so detailed server types (EXTERNAL TABLE,
+        SYSTEM TABLE, MATERIALIZED VIEW, LOCAL TEMPORARY, ...) map to TABLE or VIEW.
+        """
+        if table_type is None:
+            return None
+        upper = table_type.upper()
+        if "TABLE" in upper:
+            return "TABLE"
+        elif "VIEW" in upper:
+            return "VIEW"
+        elif "TEMPORARY" in upper:
+            # LOCAL/GLOBAL TEMPORARY objects are tables.
+            return "TABLE"
+        # Unknown type: leave it unchanged rather than guessing.
+        return table_type
+
     def __init__(self) -> None:
         self._empty_string: str = ""
         self._initialize_numeric_constants()
@@ -476,6 +545,17 @@ class MetadataAPIHelper:
         self._sql_semicolon = ";"
         self._sql_like: str = " LIKE %s;"
 
+        # Batch SHOW commands at database level (V5+)
+        self._sql_show_tables_from_db: str = "SHOW TABLES FROM DATABASE %s"
+        self._sql_show_columns_from_db: str = "SHOW COLUMNS FROM DATABASE %s"
+        self._sql_show_grants_on_tables_from_db: str = "SHOW GRANTS ON TABLES FROM DATABASE %s"
+
+        # WHERE clause filter keywords for batch SHOW commands
+        self._filter_schema_name: str = "SCHEMA_NAME"
+        self._filter_table_name: str = "TABLE_NAME"
+        self._filter_column_name: str = "COLUMN_NAME"
+        self._sql_like_placeholder: str = " LIKE %s"
+
     # Mapping of string parameter types to ProcedureColumnType enum values
     __procedure_column_type_map = {
         'IN': ProcedureColumnType.IN,
@@ -521,6 +601,13 @@ class MetadataAPIHelper:
     __sql_type_mapping = {
         "varchar": int(SQLType.SQL_VARCHAR),
         "char": int(SQLType.SQL_CHAR),
+        # text carries no length modifier on the server; it is reported as a
+        # varchar sized at _TEXT_COLUMN_SIZE (256), matching the documented
+        # Redshift conversion of TEXT to VARCHAR(256). Once the server types
+        # these columns as character varying(256) directly, this entry acts
+        # as defense in depth for older clusters and may no longer be
+        # exercised on new ones.
+        "text": int(SQLType.SQL_VARCHAR),
         "int2": int(SQLType.SQL_SMALLINT),
         "int4": int(SQLType.SQL_INTEGER),
         "int8": int(SQLType.SQL_BIGINT),
@@ -614,6 +701,31 @@ class MetadataAPIHelper:
     def get_sql_type(self, rs_type: str) -> int:
         return self.__sql_type_mapping.get(rs_type, int(SQLType.SQL_OTHER))
 
+    # Column size reported for a text column when the server provides no
+    # character maximum length. See the text entry in __sql_type_mapping.
+    _TEXT_COLUMN_SIZE = 256
+
+    def resolve_text_char_max_length(self, character_maximum_length: typing.Optional[int]) -> typing.Optional[int]:
+        """
+        Resolves the effective character maximum length for a text column.
+        Returns _TEXT_COLUMN_SIZE when the server supplies no positive
+        length; otherwise the server supplied value unchanged.
+        """
+        try:
+            if character_maximum_length is None or int(character_maximum_length) <= 0:
+                return self._TEXT_COLUMN_SIZE
+        except (TypeError, ValueError):
+            return self._TEXT_COLUMN_SIZE
+        return character_maximum_length
+
+    def get_column_type_name(self, rs_type: str) -> str:
+        """
+        Resolves the type name reported for a column. Returns varchar for a
+        text column, since text is represented as a character type sized at
+        _TEXT_COLUMN_SIZE; otherwise rs_type unchanged.
+        """
+        return "varchar" if rs_type == "text" else rs_type
+
     def get_column_size(self, rs_type: str, numeric_precision: int, character_maximum_length: int) -> Optional[int]:
         if rs_type == "numeric" or rs_type == "decimal":
             numeric_precision = max(int(numeric_precision) if numeric_precision is not None else 0, 0)
@@ -627,12 +739,23 @@ class MetadataAPIHelper:
         ):
             character_maximum_length = max(int(character_maximum_length) if character_maximum_length is not None else 0, 0)
             return character_maximum_length
+        elif rs_type == "text":
+            return self.resolve_text_char_max_length(character_maximum_length)
         elif rs_type == "super" or rs_type == "geometry" or rs_type == "geography" or rs_type == "varbyte":
             return None
         else:
             return self.__data_type_length.get(rs_type, 2147483647)
 
-    def get_column_length(self, rs_type: str) -> typing.Optional[int]:
+    def get_column_length(self, rs_type: str, character_maximum_length: int) -> typing.Optional[int]:
+        if (
+            rs_type == "varchar"
+            or rs_type == "character varying"
+            or rs_type == "char"
+            or rs_type == "character"
+            or rs_type == "bpchar"
+        ):
+            character_maximum_length = max(int(character_maximum_length) if character_maximum_length is not None else 0, 0)
+            return character_maximum_length
         return self.__buffer_length.get(rs_type, None)
 
     @staticmethod
@@ -685,6 +808,46 @@ class MetadataAPIHelper:
         return input_str is None or input_str == ""
 
     @staticmethod
+    def _normalize_match_all_pattern(pattern: Optional[str]) -> Optional[str]:
+        # A match-all pattern -- a non-empty run of only '%' ("%", "%%", "%%%", ...) -- is
+        # semantically equivalent to no filter, so map it to None and let the is_none_or_empty
+        # guards omit the redundant LIKE clause. An escaped literal "\%" contains a non-'%'
+        # char and is left intact, since it is a real filter.
+        if pattern and all(ch == "%" for ch in pattern):
+            return None
+        return pattern
+
+    def _get_driver_token(self) -> typing.Optional[str]:
+        """Returns the driver_token from connection parameter statuses, or None if not available."""
+        for item in self._cursor._c.parameter_statuses:
+            if item[0] == b"driver_token":
+                return item[1].decode()
+        return None
+
+    def _get_validated_driver_token(self) -> typing.Optional[str]:
+        """
+        Returns the driver token supplied by the server during connection startup, or None if the server
+        did not send one or sent a value that is not a well-formed UUID.
+        """
+        driver_token = self._get_driver_token()
+        if driver_token and _DRIVER_TOKEN_PATTERN.fullmatch(driver_token):
+            return driver_token
+        return None
+
+    def has_malformed_driver_token(self) -> bool:
+        """
+        Indicates whether the server sent a driver token that we cannot use, that is, a non-empty value
+        that is not a well-formed UUID.
+
+        A server that sends no token at all is not gating batch SHOW, so the batch commands are still
+        usable in that case and this returns False. Only a token that is present but malformed indicates
+        the batch command would be rejected, since the server would compare the clause we send against a
+        token it does not recognize.
+        """
+        driver_token = self._get_driver_token()
+        return bool(driver_token) and self._get_validated_driver_token() is None
+
+    @staticmethod
     def get_specific_name(name: str, argument_list: str) -> str:
         """
         Generates a specific name for a procedure or function by combining its name and argument list.
@@ -706,7 +869,7 @@ class MetadataAPIHelper:
         argument_list = "" if argument_list is None else argument_list
         return name + "(" + argument_list + ")"
 
-    def create_parameterized_query_string(self, argument_list: str, sql_base: str, column_name_pattern: str) -> typing.Tuple[str, list[str]]:
+    def create_parameterized_query_string(self, argument_list: str, sql_base: str, column_name_pattern: str) -> typing.Tuple[str, typing.List[str]]:
         """
         Creates a parameterized SQL query string based on the argument list and base SQL statement.
         Appends either a semicolon or LIKE clause depending on whether column_name_pattern is provided.
@@ -720,7 +883,7 @@ class MetadataAPIHelper:
                                      If provided, adds LIKE clause instead of semicolon
 
         Returns:
-            tuple[str, list[str]]: A tuple containing:
+            Tuple[str, List[str]]: A tuple containing:
             - str: Complete SQL query with appropriate placeholders and termination
                   (e.g. "SHOW PARAMETERS OF PROCEDURE %s.%s.%s(%s, %s, %s);" or
                         "SHOW PARAMETERS OF PROCEDURE %s.%s.%s(%s, %s, %s) LIKE %s;")

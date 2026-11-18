@@ -101,6 +101,7 @@ def test_get_procedures_legacy_considers_args(_input, mocker) -> None:
     mock_cursor: Cursor = Cursor(mock_connection)
     mock_cursor._c = mock_connection
     mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V4 = SHOW_DISCOVERY_V4
+    mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V5 = 5
 
     mock_cursor.paramstyle = "mocked_val"
     spy = mocker.spy(mock_cursor, "execute")
@@ -240,6 +241,7 @@ def test_get_catalogs_show_discovery(is_single_database_metadata_val, mocker) ->
     mock_connection: Connection = Connection.__new__(Connection)
     mock_cursor._c = mock_connection
     mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V4 = SHOW_DISCOVERY_V4
+    mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V5 = 5
     spy_execute = mocker.spy(mock_cursor, "execute")
 
     mock_connection.parameter_statuses = deque(maxlen=100)
@@ -443,6 +445,7 @@ def test_metadata_show_discovery(
     mock_connection: Connection = Connection.__new__(Connection)
     mock_cursor._c = mock_connection
     mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V4 = SHOW_DISCOVERY_V4
+    mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V5 = 5
 
     mock_connection.parameter_statuses = deque(maxlen=100)
     mock_connection.parameter_statuses.append((b'show_discovery', str(min_version).encode()))
@@ -516,6 +519,7 @@ def test_get_metadata_show_discovery_fall_back_to_hardcoded_query(mocker,test_ca
     mock_cursor.paramstyle = "mocked"
     mock_cursor._c = mock_connection
     mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V4 = SHOW_DISCOVERY_V4
+    mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V5 = 5
     spy_execute = mocker.spy(mock_cursor, test_case['legacy_query_method'])
 
     mock_connection.parameter_statuses = deque(maxlen=100)
@@ -596,6 +600,7 @@ def test_get_metadata_show_discovery_non_support(mocker, test_case) -> None:
     mock_cursor._c = mock_connection
     mock_cursor._c._database_metadata_current_db_only = True
     mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V4 = SHOW_DISCOVERY_V4
+    mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V5 = 5
 
     mock_connection.parameter_statuses = deque(maxlen=100)
     mock_connection.parameter_statuses.append((b'show_discovery', str(test_case["show_discovery_version"]).encode()))
@@ -1230,3 +1235,38 @@ def test_metadata_requests(mock_cursor, mock_server_proxy, mock_post_processor, 
         post_process_method.assert_called_once_with(server_method.return_value, **test_case["additional_args"])
     else:
         post_process_method.assert_called_once_with(server_method.return_value)
+
+
+@pytest.mark.parametrize(
+    "enable,version,expect_generalized",
+    [
+        (False, 4, True),   # OFF + SHOW path -> collapse to TABLE/VIEW
+        (True, 4, False),   # default ON -> full detailed list
+        (False, 0, False),  # OFF + legacy cluster -> full list (SHOW-path-only scope)
+    ],
+)
+def test_get_table_types_enable_table_types(enable, version, expect_generalized, mocker) -> None:
+    mock_connection: Connection = Connection.__new__(Connection)
+    mock_connection.parameter_statuses = deque(maxlen=100)
+    mock_connection._enable_table_types = enable
+    mock_cursor: Cursor = Cursor(mock_connection)
+    mock_cursor._c = mock_connection
+    mock_cursor._MIN_SHOW_DISCOVERY_VERSION_V4 = 4
+
+    mocker.patch.object(Cursor, "_check_connection", return_value=None)
+    mocker.patch.object(Cursor, "get_show_discovery_version", return_value=version)
+
+    captured: dict = {}
+
+    def fake_pp(type_list):
+        captured["list"] = type_list
+        return ()
+
+    mock_cursor._metadataAPIPostProcessor.get_table_types_post_processing = fake_pp
+
+    mock_cursor.get_table_types()
+
+    if expect_generalized:
+        assert captured["list"] == ("TABLE", "VIEW")
+    else:
+        assert captured["list"] == mock_cursor._TABLE_TYPE_LIST

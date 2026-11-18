@@ -331,6 +331,7 @@ def test_get_tables_post_processing(show_tables_col, show_tables_res) -> None:
     mock_connection.parameter_statuses = deque(maxlen=100)
     mock_connection.parameter_statuses.append((b"show_discovery", 0))
     mock_cursor._c = mock_connection
+    mock_connection._enable_table_types = True
     mock_cursor.ps = {}
     mock_cursor._SHOW_TABLES_Col_index = {}
     mock_metadataAPIPostProcessor: MetadataAPIPostProcessor = MetadataAPIPostProcessor(mock_cursor)
@@ -360,6 +361,76 @@ def test_get_tables_post_processing(show_tables_col, show_tables_res) -> None:
     for row in final_rs:
         for res1, res2 in zip(row, expected_result):
             assert res1 == res2
+
+
+def _run_get_tables_pp(enable_table_types, rows, types):
+    """Helper: run get_tables_post_processing with a mocked cursor/connection."""
+    mock_cursor: Cursor = Cursor.__new__(Cursor)
+    mock_cursor.paramstyle = "mocked"
+    mock_connection: Connection = Connection.__new__(Connection)
+    mock_connection.parameter_statuses = deque(maxlen=100)
+    mock_connection.parameter_statuses.append((b"show_discovery", 4))
+    mock_connection._enable_table_types = enable_table_types
+    mock_cursor._c = mock_connection
+    mock_cursor.ps = {}
+    mock_cursor._SHOW_TABLES_Col_index = {}
+    pp: MetadataAPIPostProcessor = MetadataAPIPostProcessor(mock_cursor)
+    pp.set_row_description(show_tables_column())
+    intermediate_rs_list = []
+    for r in rows:
+        intermediate_rs_list.append((r,))
+    for col, i in zip(mock_cursor.description, range(len(mock_cursor.description))):
+        mock_cursor._SHOW_TABLES_Col_index[col[0]] = int(i)
+    return pp.get_tables_post_processing(intermediate_rs_list, types)
+
+
+def _row(table_type):
+    # Matches show_tables_column() order; table_type is index 3.
+    return ['testCatalog', 'testSchema', 'testTable', table_type, 'testAcl',
+            'testRemarks', 'testOwner', '2012-01-01 01:01:01.123456',
+            '2012-01-01 01:01:01.123456', 'testDistStyle', 'testSubType']
+
+
+def test_get_tables_post_processing_enable_table_types_off_generalizes() -> None:
+    rows = [_row("EXTERNAL TABLE"), _row("MATERIALIZED VIEW"), _row("SYSTEM TABLE")]
+    final_rs = _run_get_tables_pp(False, rows, [])
+    # table_type is column index 3 in the output row as well.
+    out_types = [row[3] for row in final_rs]
+    assert out_types == ["TABLE", "VIEW", "TABLE"]
+
+
+def test_get_tables_post_processing_off_filter_matches_generalized() -> None:
+    rows = [_row("EXTERNAL TABLE"), _row("VIEW")]
+    # EXTERNAL TABLE collapses to TABLE and must match a "TABLE" filter; VIEW excluded.
+    final_rs = list(_run_get_tables_pp(False, rows, ["TABLE"]))
+    assert len(final_rs) == 1
+    assert final_rs[0][3] == "TABLE"
+
+
+def test_get_tables_post_processing_on_preserves_detailed_types() -> None:
+    rows = [_row("EXTERNAL TABLE")]
+    final_rs = list(_run_get_tables_pp(True, rows, []))
+    assert len(final_rs) == 1
+    assert final_rs[0][3] == "EXTERNAL TABLE"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("EXTERNAL TABLE", "TABLE"),
+        ("SYSTEM TABLE", "TABLE"),
+        ("external table", "TABLE"),       # case-insensitive
+        ("MATERIALIZED VIEW", "VIEW"),
+        ("Temporary View", "VIEW"),
+        ("LOCAL TEMPORARY", "TABLE"),
+        ("GLOBAL TEMPORARY", "TABLE"),
+        ("SEQUENCE", "SEQUENCE"),           # unknown -> unchanged
+        (None, None),                       # null -> null
+    ],
+)
+def test_generalize_table_type(raw, expected) -> None:
+    from redshift_connector.metadataAPIHelper import MetadataAPIHelper
+    assert MetadataAPIHelper.generalize_table_type(raw) == expected
 
 
 def show_columns_column() -> typing.Dict:
@@ -1116,8 +1187,8 @@ def test_get_procedure_columns_post_processing(show_parameters_col,diff_order, p
         ["testCatalog", "testSchema", "testProcedure", "testColumnNameReal", column_type, 7, "float4", 8, 4, 8, 10, 2, "", None, 7, None, None, 5, "", "specificName"],
         ["testCatalog", "testSchema", "testProcedure", "testColumnNameDouble", column_type, 8, "float8", 17, 8, 17, 10, 2, "", None, 8, None, None, 6, "", "specificName"],
         ["testCatalog", "testSchema", "testProcedure", "testColumnNameBoolean", column_type, -7, "bool", 1, 1, 0, 10, 2, "", None, -7, None, None, 7, "", "specificName"],
-        ["testCatalog", "testSchema", "testProcedure", "testColumnNameChar", column_type, 1, "char", 20, None, 0, 10, 2, "", None, 1, None, None, 8, "", "specificName"],
-        ["testCatalog", "testSchema", "testProcedure", "testColumnNameVarchar", column_type, 12, "varchar", 256, None, 0, 10, 2, "", None, 12, None, None, 9, "", "specificName"],
+        ["testCatalog", "testSchema", "testProcedure", "testColumnNameChar", column_type, 1, "char", 20, 20, 0, 10, 2, "", None, 1, None, None, 8, "", "specificName"],
+        ["testCatalog", "testSchema", "testProcedure", "testColumnNameVarchar", column_type, 12, "varchar", 256, 256, 0, 10, 2, "", None, 12, None, None, 9, "", "specificName"],
         ["testCatalog", "testSchema", "testProcedure", "testColumnNameDate", column_type, 91, "date", 13, 6, 0, 10, 2, "", None, 91, None, None, 10, "", "specificName"],
         ["testCatalog", "testSchema", "testProcedure", "testColumnNameTime", column_type, 92, "time", 15, 15, 1, 10, 2, "", None, 92, None, None, 11, "",  "specificName"],
         ["testCatalog", "testSchema", "testProcedure", "testColumnNameTimetz", column_type, 2013, "timetz", 21, 21, 2, 10, 2, "", None, 2013, None, None, 12, "", "specificName"],
@@ -1306,8 +1377,8 @@ def test_get_function_columns_post_processing(show_parameters_col,diff_order, pa
         ["testCatalog", "testSchema", "testFunction", "testColumnNameReal", column_type, 7, "float4", 8, 4, 8, 10, 2, "", None, 5, "", "specificName"],
         ["testCatalog", "testSchema", "testFunction", "testColumnNameDouble", column_type, 8, "float8", 17, 8, 17, 10, 2, "", None, 6, "", "specificName"],
         ["testCatalog", "testSchema", "testFunction", "testColumnNameBoolean", column_type, -7, "bool", 1, 1, 0, 10, 2, "", None, 7, "", "specificName"],
-        ["testCatalog", "testSchema", "testFunction", "testColumnNameChar", column_type, 1, "char", 20, None, 0, 10, 2, "", None, 8, "", "specificName"],
-        ["testCatalog", "testSchema", "testFunction", "testColumnNameVarchar", column_type, 12, "varchar", 256, None, 0, 10, 2, "", None, 9, "", "specificName"],
+        ["testCatalog", "testSchema", "testFunction", "testColumnNameChar", column_type, 1, "char", 20, 20, 0, 10, 2, "", None, 8, "", "specificName"],
+        ["testCatalog", "testSchema", "testFunction", "testColumnNameVarchar", column_type, 12, "varchar", 256, 256, 0, 10, 2, "", None, 9, "", "specificName"],
         ["testCatalog", "testSchema", "testFunction", "testColumnNameDate", column_type, 91, "date", 13, 6, 0, 10, 2, "", None, 10, "", "specificName"],
         ["testCatalog", "testSchema", "testFunction", "testColumnNameTime", column_type, 92, "time", 15, 15, 1, 10, 2, "", None, 11, "",  "specificName"],
         ["testCatalog", "testSchema", "testFunction", "testColumnNameTimetz", column_type, 2013, "timetz", 21, 21, 2, 10, 2, "", None, 12, "", "specificName"],
@@ -1346,3 +1417,98 @@ def test_get_table_types_post_processing() -> None:
     expected_result = (["EXTERNAL TABLE"], ["EXTERNAL VIEW"], ["LOCAL TEMPORARY"], ["TABLE"], ["VIEW"])
     assert final_rs == expected_result
 
+
+
+
+# ---------------------------------------------------------------------------
+# Tests for MetadataAPIPostProcessor.set_row_description.
+#
+# After the call, cursor.ps is a fresh dict whose ``row_desc`` describes
+# the JDBC-shape output columns for the metadata API. The dict that
+# cursor.ps pointed at before the call is left untouched, so that any
+# other holder of a reference to it (e.g. the Connection
+# prepared-statement cache) continues to see its original state.
+# ---------------------------------------------------------------------------
+
+def _fake_cached_ps() -> typing.Dict:
+    """
+    Build a ps dict shaped like what Connection.execute would cache after a
+    Parse/Describe cycle: a list of row_desc dicts and a matching-length
+    input_funcs tuple. The exact contents don't matter, only the lengths.
+    """
+    row_desc: typing.List = [{"label": f"col{i}".encode(), "type_oid": 25, "type_modifier": -1} for i in range(11)]
+    input_funcs: typing.Tuple = tuple(lambda x, i=i: x for i in range(11))  # 11 fake receive functions
+    return {"row_desc": row_desc, "input_funcs": input_funcs}
+
+
+def test_set_row_description_does_not_mutate_the_previously_bound_ps() -> None:
+    """
+    set_row_description rebinds cursor.ps to a new dict. The ps dict that
+    cursor.ps pointed at before the call is left untouched, so that any
+    other holder of a reference to that dict (e.g. the Connection
+    prepared-statement cache) continues to see its original row_desc list
+    and input_funcs tuple.
+    """
+    mock_cursor: Cursor = Cursor.__new__(Cursor)
+    mock_cursor.paramstyle = "mocked"
+    mock_connection: Connection = Connection.__new__(Connection)
+    mock_connection.parameter_statuses = deque(maxlen=100)
+    mock_connection.parameter_statuses.append((b"show_discovery", 0))
+    mock_cursor._c = mock_connection
+
+    # Simulate the state right after Cursor.execute has returned from a cached
+    # prepared statement: cursor.ps points at a dict also held in the cache.
+    cached_ps: typing.Dict = _fake_cached_ps()
+    original_row_desc_id: int = id(cached_ps["row_desc"])
+    original_row_desc_len: int = len(cached_ps["row_desc"])
+    original_input_funcs: typing.Tuple = cached_ps["input_funcs"]
+    mock_cursor.ps = cached_ps
+
+    mock_metadataAPIPostProcessor: MetadataAPIPostProcessor = MetadataAPIPostProcessor(mock_cursor)
+    # A representative getTables-shape column set (matches colName[MetadataAPI.get_tables]).
+    metadata_columns: typing.Dict = {name: RedshiftOID.STRING for name in colName[MetadataAPI.get_tables]}
+    mock_metadataAPIPostProcessor.set_row_description(metadata_columns)
+
+    # cursor.ps is rebound to a new dict rather than being mutated in place.
+    assert mock_cursor.ps is not cached_ps, (
+        "set_row_description must rebind cursor.ps to a new dict so that any "
+        "other holder of the previously-bound ps (e.g. the connection's "
+        "prepared-statement cache) sees an unchanged dict"
+    )
+
+    # The originally-bound dict is untouched: same row_desc list, same length,
+    # same input_funcs tuple. These invariants are what let a cache hit later
+    # return a ps whose row_desc and input_funcs are still the same length.
+    assert cached_ps["row_desc"] is not None
+    assert id(cached_ps["row_desc"]) == original_row_desc_id, "row_desc list was replaced"
+    assert len(cached_ps["row_desc"]) == original_row_desc_len, "row_desc length changed"
+    assert cached_ps["input_funcs"] is original_input_funcs, "input_funcs tuple changed"
+
+    # The new cursor.ps has the JDBC-shape row_desc so cursor.description reports the
+    # right columns.
+    assert len(mock_cursor.ps["row_desc"]) == len(colName[MetadataAPI.get_tables])
+    labels: typing.List[str] = [d["label"].decode() for d in mock_cursor.ps["row_desc"]]
+    assert labels == colName[MetadataAPI.get_tables]
+
+
+def test_set_row_description_when_previous_ps_is_none() -> None:
+    """
+    When cursor.ps starts out None (no prior execute), set_row_description
+    still allocates a fresh ps whose row_desc matches the JDBC-shape output
+    columns, so cursor.description works from the first metadata call.
+    """
+    mock_cursor: Cursor = Cursor.__new__(Cursor)
+    mock_cursor.paramstyle = "mocked"
+    mock_connection: Connection = Connection.__new__(Connection)
+    mock_connection.parameter_statuses = deque(maxlen=100)
+    mock_connection.parameter_statuses.append((b"show_discovery", 0))
+    mock_cursor._c = mock_connection
+    mock_cursor.ps = None
+
+    mock_metadataAPIPostProcessor: MetadataAPIPostProcessor = MetadataAPIPostProcessor(mock_cursor)
+    metadata_columns: typing.Dict = {name: RedshiftOID.STRING for name in colName[MetadataAPI.get_catalogs]}
+    mock_metadataAPIPostProcessor.set_row_description(metadata_columns)
+
+    assert mock_cursor.ps is not None
+    assert "row_desc" in mock_cursor.ps
+    assert len(mock_cursor.ps["row_desc"]) == len(colName[MetadataAPI.get_catalogs])

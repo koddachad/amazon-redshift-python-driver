@@ -24,6 +24,7 @@ from redshift_connector.error import (
     Warning,
 )
 from redshift_connector.iam_helper import IamHelper
+from redshift_connector.idp_auth_helper import set_plugin_allowlist
 from redshift_connector.objects import (
     Binary,
     Date,
@@ -164,6 +165,7 @@ def connect(
     allow_db_user_override: typing.Optional[bool] = None,
     client_protocol_version: typing.Optional[int] = None,
     database_metadata_current_db_only: typing.Optional[bool] = None,
+    enable_table_types: typing.Optional[bool] = None,
     ssl_insecure: typing.Optional[bool] = None,
     web_identity_token: typing.Optional[str] = None,
     role_session_name: typing.Optional[str] = None,
@@ -264,6 +266,8 @@ def connect(
          The requested server protocol version. The default value is 2 representing `BINARY`. If the requested server protocol cannot be satisfied a warning will be displayed to the user and the driver will default to the highest supported protocol. See `ClientProtocolVersion` for more details.
     database_metadata_current_db_only : Optional[bool]
         Is `datashare <https://docs.aws.amazon.com/redshift/latest/dg/datashare-overview.html>`_ disabled. Default value is True, implying datasharing will not be used.
+    enable_table_types : Optional[bool]
+        Controls the granularity of TABLE_TYPE values reported by ``get_tables`` and ``get_table_types`` on the server SHOW path. Default value is True, reporting detailed server table types (for example EXTERNAL TABLE, SYSTEM TABLE). When False, table types are collapsed into the generic TABLE and VIEW buckets.
     ssl_insecure : Optional[bool]
         Specifies whether to disable the verification of the IdP host's server SSL certificate. Default value is False. ssl_insecure=True indicates that verification of the IdP host's server SSL certificate will be disabled. It is NOT recommended to disable the verification of an IdP host's server SSL certificate in a production environment.
     web_identity_token: Optional[str]
@@ -328,6 +332,7 @@ def connect(
     info.put("cluster_identifier", cluster_identifier)
     info.put("credentials_provider", credentials_provider)
     info.put("database_metadata_current_db_only", database_metadata_current_db_only)
+    info.put("enable_table_types", enable_table_types)
     info.put("db_groups", db_groups)
     info.put("db_name", database)
     info.put("db_user", db_user)
@@ -371,6 +376,7 @@ def connect(
     info.put("ssl", ssl)
     info.put("ssl_insecure", ssl_insecure)
     info.put("sslmode", sslmode)
+    info.sslmode_explicit = sslmode is not None
     info.put("tcp_keepalive", tcp_keepalive)
     info.put("tcp_keepalive_idle", tcp_keepalive_idle)
     info.put("tcp_keepalive_interval", tcp_keepalive_interval)
@@ -450,6 +456,7 @@ def connect(
         unix_sock=info.unix_sock,
         ssl=info.ssl,
         sslmode=info.sslmode,
+        sslmode_defaulted=not info.sslmode_explicit,
         timeout=info.timeout,
         max_prepared_statements=info.max_prepared_statements,
         tcp_keepalive=info.tcp_keepalive,
@@ -459,6 +466,7 @@ def connect(
         application_name=info.application_name,
         client_protocol_version=info.client_protocol_version,
         database_metadata_current_db_only=info.database_metadata_current_db_only,
+        enable_table_types=info.enable_table_types,
         credentials_provider=info.credentials_provider,
         provider_name=info.provider_name,
         web_identity_token=info.web_identity_token,
@@ -501,6 +509,7 @@ __all__: typing.Any = [
     "DataError",
     "DatabaseError",
     "connect",
+    "set_plugin_allowlist",
     "InterfaceError",
     "ProgrammingError",
     "Error",

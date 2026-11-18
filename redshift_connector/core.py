@@ -20,6 +20,7 @@ from scramp import ScramClient  # type: ignore
 from redshift_connector.config import (
     DEFAULT_MAX_PREPARED_STATEMENTS,
     DEFAULT_PROTOCOL_VERSION,
+    DRIVER_DISCOVERY_VERSION,
     ClientProtocolVersion,
     DbApiParamstyle,
     _client_encoding,
@@ -33,6 +34,7 @@ from redshift_connector.config import (
     pg_to_py_encodings,
 )
 from redshift_connector.cursor import Cursor
+from redshift_connector.hostname_check import match_hostname
 from redshift_connector.error import (
     ArrayContentNotHomogenousError,
     ArrayContentNotSupportedError,
@@ -129,6 +131,24 @@ if TYPE_CHECKING:
 __author__ = "Mathieu Fenniak"
 
 _logger: logging.Logger = logging.getLogger(__name__)
+
+def _warn_hostname_mismatch(host: str) -> None:
+    """Warn that a hostname mismatch was tolerated because sslmode was not set.
+
+    Logged every time, not once per host: the count is what shows how many
+    connections rely on the allowance. The log is the only channel -- this
+    connection succeeded, so nothing goes to stderr.
+    """
+    # Double-quoted rather than {!r}, which renders single quotes: the text must
+    # stay stable so one search finds it in a support case.
+    message: str = (
+        'Server certificate does not name host "{}". The connection was allowed '
+        "because sslmode was not set. A future release will require the "
+        "certificate to name the host being connected to; if you connect through "
+        "a name the certificate does not carry, set sslmode=verify-ca.".format(host)
+    )
+    _logger.warning(message)
+
 
 ZERO: Timedelta = Timedelta(0)
 BINARY: type = bytes
@@ -415,7 +435,8 @@ class Connection:
         source_address: typing.Optional[str] = None,
         unix_sock: typing.Optional[str] = None,
         ssl: bool = True,
-        sslmode: str = "verify-ca",
+        sslmode: str = "verify-full",
+        sslmode_defaulted: bool = False,
         timeout: typing.Optional[int] = None,
         max_prepared_statements: int = DEFAULT_MAX_PREPARED_STATEMENTS,
         tcp_keepalive: typing.Optional[bool] = True,
@@ -425,6 +446,7 @@ class Connection:
         application_name: typing.Optional[str] = None,
         client_protocol_version: int = DEFAULT_PROTOCOL_VERSION,
         database_metadata_current_db_only: bool = True,
+        enable_table_types: bool = True,
         credentials_provider: typing.Optional[str] = None,
         provider_name: typing.Optional[str] = None,
         web_identity_token: typing.Optional[str] = None,
@@ -508,6 +530,7 @@ class Connection:
             "unix_sock": unix_sock,
             "ssl": ssl,
             "sslmode": sslmode,
+            "sslmode_defaulted": sslmode_defaulted,
             "timeout": timeout,
             "max_prepared_statements": max_prepared_statements,
             "tcp_keepalive": tcp_keepalive,
@@ -517,6 +540,7 @@ class Connection:
             "application_name": application_name,
             "client_protocol_version": client_protocol_version,
             "database_metadata_current_db_only": database_metadata_current_db_only,
+            "enable_table_types": enable_table_types,
             "credentials_provider": credentials_provider,
             "provider_name": provider_name,
             "web_identity_token": web_identity_token,
@@ -552,6 +576,7 @@ class Connection:
         self.py_types = deepcopy(PY_TYPES)
         self.redshift_types = deepcopy(REDSHIFT_TYPES)
         self._database_metadata_current_db_only: bool = database_metadata_current_db_only
+        self._enable_table_types: bool = enable_table_types
         self.numeric_to_float: bool = numeric_to_float
 
         # based on _client_protocol_version value, we must use different conversion functions
@@ -596,6 +621,7 @@ class Connection:
             "client_protocol_version": str(self._client_protocol_version),
             "driver_version": DriverInfo.driver_full_name(),
             "os_version": self.client_os_version,
+            "driver_discovery_version": str(DRIVER_DISCOVERY_VERSION),
         }
 
         if credentials_provider:
@@ -720,9 +746,19 @@ class Connection:
                         _logger.debug("applying sslmode=%s to socket", sslmode)
                         self._usock = ssl_context.wrap_socket(self._usock)
                     elif sslmode == "verify-full":
-                        _logger.debug("applying sslmode=%s to socket and force check_hostname", sslmode)
-                        ssl_context.check_hostname = True
-                        self._usock = ssl_context.wrap_socket(self._usock, server_hostname=host)
+                        _logger.debug("applying sslmode=%s to socket", sslmode)
+                        if sslmode_defaulted:
+                            # Driver chose the mode: check the name after the handshake so
+                            # a mismatch warns. Chain still CERT_REQUIRED either way.
+                            ssl_context.check_hostname = False
+                            self._usock = ssl_context.wrap_socket(self._usock, server_hostname=host)
+                            if not match_hostname(self._usock.getpeercert(), host):
+                                _warn_hostname_mismatch(host)
+                        else:
+                            # Caller asked for verify-full: leave OpenSSL as the gate, so
+                            # the local matcher can never admit a certificate for them.
+                            ssl_context.check_hostname = True
+                            self._usock = ssl_context.wrap_socket(self._usock, server_hostname=host)
                     else:
                         _logger.debug("unknown sslmode=%s is ignored", sslmode)
                     _logger.debug("Socket SSL details: %s", self._usock.cipher())  # type: ignore
@@ -975,6 +1011,16 @@ class Connection:
 
         else:
             return self._database_metadata_current_db_only or not self._is_multi_databases_catalog_enable_in_server
+
+    @property
+    def is_enable_table_types(self):
+        """
+        Returns True (the default) when the ``enable_table_types`` connection
+        parameter reports detailed server table types from ``get_tables`` and
+        ``get_table_types`` on the SHOW path. Returns False when the option is
+        disabled, in which case detailed types are collapsed to TABLE/VIEW.
+        """
+        return self._enable_table_types is not False
 
     def handle_ERROR_RESPONSE(self: "Connection", data, ps):
         """
@@ -1942,16 +1988,61 @@ class Connection:
             ps["bind_2"] = h_pack(len(output_fc)) + pack("!" + "h" * len(output_fc), *output_fc)
 
             if self.max_prepared_statements > 0:
-                # Ensure consistency between ps and statement_dict
+                # Ensure consistency between ps and statement_dict.
+                # A length mismatch indicates stale keys in statement_dict
+                # (e.g. after DDL/ROLLBACK clears ps but not statement_dict).
+                # We do a full rebuild: clear statement_dict first, then
+                # re-add only keys that exist in ps. This loses the original
+                # LRU ordering, but that's acceptable because the mismatch
+                # only occurs after DDL/ROLLBACK which invalidated all prior
+                # entries anyway — the surviving keys get fresh ordering.
                 if len(cache["ps"]) != len(cache["statement_dict"]):
+                    _logger.debug(
+                        "Consistency repair: rebuilding statement_dict from ps (%d -> %d entries)",
+                        len(cache["statement_dict"]),
+                        len(cache["ps"]),
+                    )
+                    cache["statement_dict"].clear()
                     for existing_key in cache["ps"]:
                         cache["statement_dict"][existing_key] = None
 
-                # If cache is full, remove oldest statement
+                # If cache is full, evict the least recently used statement.
+                # We use a while loop instead of a single pop as a
+                # defense-in-depth measure: if statement_dict contains
+                # stale keys not present in ps (e.g. after DDL/ROLLBACK
+                # clears ps but not statement_dict), we discard them
+                # lazily here rather than crashing with a KeyError.
+                # In normal operation the first pop always finds a valid
+                # key, so this behaves identically to a single-pop eviction
+                # with zero overhead on the happy path.
                 if len(cache["ps"]) >= self.max_prepared_statements:
-                    oldest_key, _ = cache["statement_dict"].popitem(last=False)
-                    statements_to_close.append(cache["ps"][oldest_key]["statement_name_bin"])
-                    del cache["ps"][oldest_key]
+                    while cache["statement_dict"]:
+                        oldest_key, _ = cache["statement_dict"].popitem(last=False)
+                        if oldest_key in cache["ps"]:
+                            statements_to_close.append(cache["ps"][oldest_key]["statement_name_bin"])
+                            del cache["ps"][oldest_key]
+                            break
+                        else:
+                            _logger.debug("Eviction discarded stale key from statement_dict: %s", oldest_key)
+                    else:
+                        # statement_dict exhausted — all entries were stale, none
+                        # matched a key in ps. At this point len(statement_dict) == 0
+                        # and no eviction occurred, so the new entry added below will
+                        # temporarily grow ps to max_prepared_statements + 1.
+                        #
+                        # We intentionally do NOT rebuild statement_dict here because
+                        # the next execute() call will detect the length mismatch
+                        # (len(ps) != len(statement_dict)) in the consistency-repair
+                        # check above and rebuild statement_dict from ps automatically.
+                        # That rebuild restores full sync, and the subsequent eviction
+                        # will succeed normally.
+                        _logger.warning(
+                            "Eviction failed: statement_dict exhausted without finding a valid key in ps. "
+                            "ps has %d entries (max_prepared_statements=%d). "
+                            "The next execute() will trigger consistency-repair to restore sync.",
+                            len(cache["ps"]),
+                            self.max_prepared_statements,
+                        )
 
                 # Add new statement to cache and queue
                 cache["ps"][key] = ps
@@ -2143,11 +2234,20 @@ class Connection:
             cursor._redshift_row_count = len(cursor._cached_rows)
 
         if command in (b"ALTER", b"CREATE", b"DROP", b"ROLLBACK"):
+            # DDL and ROLLBACK invalidate all server-side prepared
+            # statements. Close each one explicitly, then clear both
+            # the metadata cache (ps) and the LRU tracking dict
+            # (statement_dict) together to keep them synchronized.
+            # Clearing only ps without statement_dict would leave
+            # stale keys that cause a KeyError crash during eviction
+            # when the cache later refills.
             for scache in self._caches.values():
                 for pcache in scache.values():
                     for ps in pcache["ps"].values():
                         self.close_prepared_statement(ps["statement_name_bin"])
                     pcache["ps"].clear()
+                    if pcache.get("statement_dict") is not None:
+                        pcache["statement_dict"].clear()
 
     def handle_DATA_ROW(self: "Connection", data: bytes, cursor: Cursor) -> None:
         """
@@ -2485,7 +2585,8 @@ class Connection:
         _logger.debug("ParameterStatus message received from BE")
         pos: int = data.find(NULL_BYTE)
         key, value = data[:pos], data[pos + 1 : -1]
-        _logger.debug("key=%s value=%s", key, value)
+        # The driver_token value must not reach log files.
+        _logger.debug("key=%s value=%s", key, b"[REDACTED]" if key == b"driver_token" else value)
         self.parameter_statuses.append((key, value))
         if key == b"client_encoding":
             encoding = value.decode("ascii").lower()

@@ -131,29 +131,37 @@ class MetadataAPIPostProcessor(MetadataAPIHelper):
         )
 
     def get_tables_post_processing(self, intermediate_rs: typing.List[typing.Tuple], types: list) -> typing.Tuple:
+        # When enable_table_types is disabled, collapse detailed server types
+        # (EXTERNAL TABLE, SYSTEM TABLE, MATERIALIZED VIEW, ...) to the generic
+        # TABLE/VIEW buckets. Generalize BEFORE the requested-type filter so a
+        # client filtering on "TABLE" still matches external tables, etc.
+        enable_table_types: bool = self._cursor._c.is_enable_table_types
+
         def transform_tables_rows(rows, table_types=None):
-            return (
-                [
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_database_name]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_schema_name]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_name]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_type]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_remarks]],
-                    self._empty_string,
-                    self._empty_string,
-                    self._empty_string,
-                    self._empty_string,
-                    self._empty_string,
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_owner]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_last_altered_time]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_last_modified_time]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_dist_style]],
-                    row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_subtype]],
-                ]
-                for row in rows
-                if table_types is None or len(table_types) == 0 or
-                   row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_type]] in table_types
-            )
+            result = []
+            for row in rows:
+                table_type = row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_type]]
+                if not enable_table_types:
+                    table_type = MetadataAPIHelper.generalize_table_type(table_type)
+                if table_types is None or len(table_types) == 0 or table_type in table_types:
+                    result.append([
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_database_name]],
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_schema_name]],
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_name]],
+                        table_type,
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_remarks]],
+                        self._empty_string,
+                        self._empty_string,
+                        self._empty_string,
+                        self._empty_string,
+                        self._empty_string,
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_owner]],
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_last_altered_time]],
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_last_modified_time]],
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_dist_style]],
+                        row[self._cursor._SHOW_TABLES_Col_index[self._SHOW_TABLES_table_subtype]],
+                    ])
+            return result
 
         return self._generic_post_processing(
             metadata_api="get_tables",
@@ -173,7 +181,7 @@ class MetadataAPIPostProcessor(MetadataAPIHelper):
                     row[self._cursor._SHOW_COLUMNS_Col_index[self._SHOW_COLUMNS_table_name]],
                     row[self._cursor._SHOW_COLUMNS_Col_index[self._SHOW_COLUMNS_column_name]],
                     sql_type,
-                    rs_type,
+                    self.get_column_type_name(rs_type),
                     self.get_column_size(
                         rs_type,
                         row[self._cursor._SHOW_COLUMNS_Col_index[self._SHOW_COLUMNS_numeric_precision]],
@@ -472,7 +480,9 @@ class MetadataAPIPostProcessor(MetadataAPIHelper):
                                              self._SHOW_PARAMETERS_numeric_precision]],
                                          row[self._cursor._SHOW_PARAMETERS_PRO_Col_index[
                                              self._SHOW_PARAMETERS_character_maximum_length]]),
-                    self.get_column_length(rs_type),
+                    self.get_column_length(rs_type,
+                                           row[self._cursor._SHOW_PARAMETERS_PRO_Col_index[
+                                               self._SHOW_PARAMETERS_character_maximum_length]]),
                     self.get_decimal_digits(rs_type,
                                             row[self._cursor._SHOW_PARAMETERS_PRO_Col_index[
                                                 self._SHOW_PARAMETERS_numeric_scale]],
@@ -591,7 +601,9 @@ class MetadataAPIPostProcessor(MetadataAPIHelper):
                                              self._SHOW_PARAMETERS_numeric_precision]],
                                          row[self._cursor._SHOW_PARAMETERS_FUNC_Col_index[
                                              self._SHOW_PARAMETERS_character_maximum_length]]),
-                    self.get_column_length(rs_type),
+                    self.get_column_length(rs_type,
+                                           row[self._cursor._SHOW_PARAMETERS_FUNC_Col_index[
+                                               self._SHOW_PARAMETERS_character_maximum_length]]),
                     self.get_decimal_digits(rs_type,
                                             row[self._cursor._SHOW_PARAMETERS_FUNC_Col_index[
                                                 self._SHOW_PARAMETERS_numeric_scale]],
@@ -649,14 +661,20 @@ class MetadataAPIPostProcessor(MetadataAPIHelper):
         Sets up the row description for the result set.
         Creates a standardized description dictionary for each column.
 
+        A new ``ps`` dict is allocated for the cursor rather than mutating
+        the one currently bound. ``self._cursor.ps`` may be a live reference
+        to a prepared statement held in the Connection prepared-statement
+        cache, and the cache relies on each cached ``ps`` having a
+        ``row_desc`` list whose length matches its ``input_funcs`` tuple.
+        Rebinding ``cursor.ps`` to a new dict preserves that invariant.
+
         Args:
             cur_column: Dictionary mapping column names to their OIDs
         """
 
-        if self._cursor.ps is None:
-            self._cursor.ps = {}
-
-        self._cursor.ps["row_desc"] = []
+        # Allocate a fresh dict for the cursor's "current ps" so any cached
+        # prepared statement reachable via ``cursor.ps`` is not mutated.
+        self._cursor.ps = {"row_desc": []}
 
         for col_name, col_oid in cur_column.items():
             row_desc: typing.Dict = {'autoincrement': 0,
