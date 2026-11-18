@@ -45,6 +45,7 @@ redshift_test_data: typing.Dict[
         typing.List[
             typing.Union[
                 typing.Tuple[str, ...],
+                typing.Tuple[str, typing.Optional[bytes]],
                 typing.Tuple[str, IntervalYearToMonth, str],
                 typing.Tuple[str, IntervalDayToSecond, str],
             ]
@@ -103,8 +104,14 @@ redshift_test_data: typing.Dict[
             ),
         ),
     ),
+    # VARBYTE test data: (sql expression, expected Python value). This fork returns
+    # VARBYTE as ``bytes`` on both client protocols (KAN-101), so every expected
+    # value is ``bytes`` (or None for SQL NULL), never a hex ``str``.
+    #
+    # Casting a varchar literal to varbyte yields the UTF-8 bytes of the string,
+    # e.g. '00'::varbyte is b"00" (0x3030), not b"\x00".
     RedshiftDatatypes.varbyte.name: [
-        ("'{}'::varbyte".format(x), x)
+        ("'{}'::varbyte".format(x), x.encode("utf-8"))
         for x in (
             "00",
             "1111",
@@ -170,6 +177,33 @@ redshift_test_data: typing.Dict[
             "99ffffffffffffff",
             "ffffffffffffff",
         )
+    ]
+    + [
+        # Values that are not valid UTF-8. Before KAN-101 the binary protocol
+        # decoded VARBYTE as text, so these raised UnicodeDecodeError.
+        ("from_hex('ff00fe')", b"\xff\x00\xfe"),
+        ("from_hex('80')", b"\x80"),  # lone UTF-8 continuation byte
+        ("from_hex('c0af')", b"\xc0\xaf"),  # overlong UTF-8 encoding
+        ("from_hex('f5808080')", b"\xf5\x80\x80\x80"),  # invalid UTF-8 lead byte
+        ("from_hex('eda080')", b"\xed\xa0\x80"),  # UTF-16 surrogate, invalid in UTF-8
+        ("from_hex('{}')".format("ff" * 64), b"\xff" * 64),
+        ("from_hex('deadbeef')", b"\xde\xad\xbe\xef"),
+        # ASCII-looking values must still come back as bytes, not str.
+        ("from_hex('414243')", b"ABC"),
+        ("from_hex('30')", b"0"),
+        # Empty value and embedded NULs.
+        ("from_hex('')", b""),
+        ("from_hex('00')", b"\x00"),
+        ("from_hex('{}')".format("00" * 8), b"\x00" * 8),
+        ("from_hex('00ff00ff')", b"\x00\xff\x00\xff"),
+        # Other VARBYTE constructors and concatenation.
+        ("to_varbyte('ff00fe', 'hex')", b"\xff\x00\xfe"),
+        ("to_varbyte('/wD+', 'base64')", b"\xff\x00\xfe"),
+        ("to_varbyte('abc', 'utf8')", b"abc"),
+        ("to_varbyte('1111111100000000', 'binary')", b"\xff\x00"),
+        ("'abc'::varbyte || from_hex('ff')", b"abc\xff"),
+        # SQL NULL round-trips as None.
+        ("null::varbyte", None),
     ],
     RedshiftDatatypes.intervaly2m.name: [
         ("37 months", IntervalYearToMonth(37), "y2m_postgres_format"),

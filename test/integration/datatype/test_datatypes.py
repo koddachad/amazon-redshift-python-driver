@@ -22,6 +22,7 @@ import pytest  # type: ignore
 import redshift_connector
 from redshift_connector.config import ClientProtocolVersion
 from redshift_connector.interval import IntervalDayToSecond, IntervalYearToMonth
+from redshift_connector.utils.oids import RedshiftOID
 
 conf = configparser.ConfigParser()
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(os.path.join(__file__, os.pardir))))
@@ -97,27 +98,115 @@ def test_redshift_specific_recv_support(db_kwargs, _input, client_protocol) -> N
             results: typing.Tuple = cursor.fetchall()
             assert len(results) == 1
             assert len(results[0]) == 1
-            if datatype in ("varbyte", "geography", "geometry"):
+            if datatype == "varbyte":
+                # This fork returns VARBYTE as bytes on every protocol (KAN-101).
+                if exp_val is None:
+                    assert results[0][0] is None
+                else:
+                    assert type(results[0][0]) is bytes
+                    assert results[0][0] == exp_val
+            elif datatype in ("geography", "geometry"):
                 assert results[0][0].lower() == exp_val.lower()
             else:
                 assert results[0][0] == exp_val
 
 
+varbyte_testcases: typing.List[typing.Tuple[str, typing.Optional[bytes]]] = redshift_test_data[
+    RedshiftDatatypes.varbyte.name
+]  # type: ignore
+varbyte_values: typing.List[typing.Optional[bytes]] = [case[1] for case in varbyte_testcases]
+
+
 @pytest.mark.parametrize("client_protocol", ClientProtocolVersion.list())
-@pytest.mark.parametrize("_input", redshift_test_data[RedshiftDatatypes.varbyte.name])
+@pytest.mark.parametrize("_input", varbyte_testcases)
 def test_redshift_varbyte_insert(db_kwargs, _input, client_protocol) -> None:
+    """
+    Round-trip each VARBYTE test value through a bound bytes parameter and
+    back out of a table, on each client protocol.
+    """
     db_kwargs["client_protocol_version"] = client_protocol
-    datatype, data = _input
+    _, data = _input
 
     with redshift_connector.connect(**db_kwargs) as con:
         with con.cursor() as cursor:
             cursor.execute("create table t_varbyte (id int, v1 varbyte)")
-            cursor.execute("insert into t_varbyte(v1) values(%s)", (bytes(data, encoding="utf-8"),))
+            cursor.execute("insert into t_varbyte(v1) values(%s)", (data,))
             cursor.execute("select id, v1 from t_varbyte")
             results: typing.Tuple = cursor.fetchall()
             assert len(results) == 1
             assert len(results[0]) == 2
-            assert results[0][1] == bytes(data, encoding="utf-8").hex()
+            assert cursor.description[1][1] == RedshiftOID.VARBYTE
+            if data is None:
+                assert results[0][1] is None
+            else:
+                assert type(results[0][1]) is bytes
+                assert results[0][1] == data
+
+
+@pytest.mark.parametrize("client_protocol", ClientProtocolVersion.list())
+@pytest.mark.parametrize("streaming", [False, True])
+def test_redshift_varbyte_multi_row(db_kwargs, client_protocol, streaming) -> None:
+    """
+    All VARBYTE test values in one table, read back in a single result set
+    through both the regular and the fork's streaming cursor. Exercises the
+    receiver across many DataRows of varying length in one stream, including
+    NULL and empty values next to non-UTF-8 ones.
+    """
+    db_kwargs["client_protocol_version"] = client_protocol
+
+    with redshift_connector.connect(**db_kwargs) as con:
+        with con.cursor() as cursor:
+            cursor.execute("create table t_varbyte (id int, v1 varbyte)")
+            for idx, value in enumerate(varbyte_values):
+                cursor.execute("insert into t_varbyte(id, v1) values(%s, %s)", (idx, value))
+        with con.cursor() as cursor:
+            cursor.streaming = streaming
+            cursor.streaming_batch_size = 7
+            cursor.execute("select id, v1 from t_varbyte order by id")
+            results: typing.Tuple = cursor.fetchall()
+            assert len(results) == len(varbyte_values)
+            for (idx, value), expected in zip(results, varbyte_values):
+                assert value == expected, "row {}".format(idx)
+                assert value is None or type(value) is bytes
+
+
+@pytest.mark.parametrize("client_protocol", ClientProtocolVersion.list())
+def test_redshift_varbyte_where_clause(db_kwargs, client_protocol) -> None:
+    """A bytes parameter can be used to look up a VARBYTE row, including non-UTF-8 values."""
+    db_kwargs["client_protocol_version"] = client_protocol
+    needle: bytes = b"\xff\x00\xfe"
+
+    with redshift_connector.connect(**db_kwargs) as con:
+        with con.cursor() as cursor:
+            cursor.execute("create table t_varbyte (id int, v1 varbyte)")
+            cursor.execute("insert into t_varbyte(id, v1) values(1, %s), (2, %s), (3, null)", (b"ABC", needle))
+            cursor.execute("select id, v1 from t_varbyte where v1 = %s", (needle,))
+            results: typing.Tuple = cursor.fetchall()
+            assert len(results) == 1
+            assert results[0][0] == 2
+            assert results[0][1] == needle
+            cursor.execute("select count(*) from t_varbyte where v1 is null")
+            assert cursor.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("client_protocol", ClientProtocolVersion.list())
+def test_redshift_varbyte_server_side_functions(db_kwargs, client_protocol) -> None:
+    """
+    VARBYTE values written from bytes parameters agree with the server's own
+    hex/length functions, proving the driver sends the exact bytes it is given.
+    """
+    db_kwargs["client_protocol_version"] = client_protocol
+    value: bytes = bytes(range(256))
+
+    with redshift_connector.connect(**db_kwargs) as con:
+        with con.cursor() as cursor:
+            cursor.execute("create table t_varbyte (id int, v1 varbyte(1024))")
+            cursor.execute("insert into t_varbyte(id, v1) values(1, %s)", (value,))
+            cursor.execute("select to_hex(v1), length(v1), v1 from t_varbyte")
+            hex_str, length, roundtrip = cursor.fetchone()
+            assert hex_str.lower() == value.hex()
+            assert length == len(value)
+            assert roundtrip == value
 
 
 @pytest.mark.parametrize("client_protocol", ClientProtocolVersion.list())
@@ -191,7 +280,8 @@ def test_redshift_varbyte_insert_python_bytes(db_kwargs, _input, client_protocol
             results: typing.Tuple = cursor.fetchall()
             assert len(results) == 1
             assert len(results[0]) == 2
-            assert results[0][1] == data.hex()
+            assert type(results[0][1]) is bytes
+            assert results[0][1] == data
 
 
 @pytest.mark.parametrize("client_protocol", ClientProtocolVersion.list())
