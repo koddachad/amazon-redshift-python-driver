@@ -1,6 +1,12 @@
 Changelog
 =========
 
+v2.2.0.post2 (2026-11-18) - fork
+--------------------------------
+- Fork fix (KAN-101): VARBYTE columns are now returned as ``bytes`` on the default binary protocol. Previously the driver decoded them as UTF-8 text, which returned the wrong value for ASCII-looking data and raised ``UnicodeDecodeError`` for anything else. Redshift sends VARBYTE as raw bytes on the binary protocol regardless of the requested format code, so the driver now registers a raw-bytes receiver for it. The text protocol already returned ``bytes`` via hex decoding, so both protocols are now consistent.
+- Added ``test/manual/check_varbyte_format.py`` to verify VARBYTE wire behaviour against a live cluster.
+
+
 v2.2.0.post1 (2026-11-18) - fork
 --------------------------------
 - Merged upstream v2.2.0 into the streaming-cursor fork.

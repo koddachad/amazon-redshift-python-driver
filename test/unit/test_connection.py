@@ -575,3 +575,49 @@ def test_tcp_keepalive_validation(idle, interval, count, expected_error):
     else:
         # Should not raise any exception
         validate_keepalive_values(idle, interval, count)
+
+
+# ---------------------------------------------------------------------------
+# KAN-101: VARBYTE must be registered with a raw-bytes receiver on the binary
+# protocol and with the hex receiver on the text protocol, so that both
+# protocols return ``bytes`` and non-UTF-8 values do not raise.
+# ---------------------------------------------------------------------------
+def _connection_with_protocol(protocol_version: int) -> Connection:
+    from copy import deepcopy
+
+    from redshift_connector.utils import redshift_types as REDSHIFT_TYPES
+
+    conn: Connection = Connection.__new__(Connection)
+    conn.redshift_types = deepcopy(REDSHIFT_TYPES)
+    conn._client_protocol_version = protocol_version
+    conn.numeric_to_float = False
+    conn._enable_protocol_based_conversion_funcs()
+    return conn
+
+
+def test_varbyte_binary_protocol_uses_raw_bytes_receiver() -> None:
+    from redshift_connector.config import FC_BINARY
+    from redshift_connector.utils.oids import RedshiftOID
+    from redshift_connector.utils.type_utils import varbyte_recv_binary
+
+    conn = _connection_with_protocol(ClientProtocolVersion.BINARY.value)
+    fc, func = conn.redshift_types[RedshiftOID.VARBYTE]
+    assert fc == FC_BINARY
+    assert func is varbyte_recv_binary
+    assert func(b"\xff\x00\xfe", 0, 3) == b"\xff\x00\xfe"
+
+
+@pytest.mark.parametrize(
+    "protocol_version",
+    [ClientProtocolVersion.BASE_SERVER.value, ClientProtocolVersion.EXTENDED_RESULT_METADATA.value],
+)
+def test_varbyte_text_protocol_uses_hex_receiver(protocol_version: int) -> None:
+    from redshift_connector.config import FC_TEXT
+    from redshift_connector.utils.oids import RedshiftOID
+    from redshift_connector.utils.type_utils import varbytehex_recv
+
+    conn = _connection_with_protocol(protocol_version)
+    fc, func = conn.redshift_types[RedshiftOID.VARBYTE]
+    assert fc == FC_TEXT
+    assert func is varbytehex_recv
+    assert func(b"ff00fe", 0, 6) == b"\xff\x00\xfe"

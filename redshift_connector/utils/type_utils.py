@@ -556,7 +556,23 @@ def geometryhex_recv(data: bytes, idx: int, length: int) -> str:
 
 
 def varbytehex_recv(data: bytes, idx: int, length: int) -> bytes:
+    """
+    VARBYTE receiver for the text protocol: the server sends the value as a
+    hex string, which is decoded to the underlying bytes.
+    """
     return codecs_decode(data[idx : idx + length], "hex_codec")
+
+
+def varbyte_recv_binary(data: bytes, idx: int, length: int) -> bytes:
+    """
+    VARBYTE receiver for the binary protocol (client_protocol_version >= 2).
+
+    On the binary protocol Redshift sends VARBYTE as the raw bytes regardless
+    of the format code requested in Bind, and reports format=1 in the
+    RowDescription. The value is returned untouched as ``bytes``; decoding it
+    as text would corrupt binary data or raise UnicodeDecodeError.
+    """
+    return bytes(data[idx : idx + length])
 
 
 # def inet_in(data: bytes, offset: int, length: int) -> typing.Union[IPv4Address, IPv6Address, IPv4Network, IPv6Network]:

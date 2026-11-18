@@ -125,3 +125,35 @@ def test_vector_in_rejects_code_injection(payload) -> None:
     """Verify vector_in raises an exception for non-integer input instead of executing it."""
     with pytest.raises((ValueError, TypeError)):
         type_utils.vector_in(payload, 0, len(payload))
+
+
+# ---------------------------------------------------------------------------
+# VARBYTE receivers (KAN-101). On the binary protocol Redshift sends the raw
+# bytes regardless of the requested format code; on the text protocol it sends
+# a hex string. Both receivers must return ``bytes`` and must never attempt a
+# text decode, so values that are not valid UTF-8 round-trip unchanged.
+# ---------------------------------------------------------------------------
+varbyte_cases: typing.List[typing.Tuple[bytes, bytes]] = [
+    (b"\xff\x00\xfe", b"\xff\x00\xfe"),  # not valid UTF-8
+    (b"ABC", b"ABC"),  # happens to be ASCII
+    (b"", b""),  # empty value
+    (b"\x00" * 8, b"\x00" * 8),  # embedded NULs
+]
+
+
+@pytest.mark.parametrize("raw, expected", varbyte_cases)
+def test_varbyte_recv_binary_returns_raw_bytes(raw: bytes, expected: bytes) -> None:
+    # surround with padding to prove offset/length are honoured
+    data = b"<<" + raw + b">>"
+    result = type_utils.varbyte_recv_binary(data, 2, len(raw))
+    assert result == expected
+    assert type(result) is bytes
+
+
+@pytest.mark.parametrize("raw, expected", varbyte_cases)
+def test_varbytehex_recv_decodes_hex_to_bytes(raw: bytes, expected: bytes) -> None:
+    hex_payload = raw.hex().encode("ascii")
+    data = b"<<" + hex_payload + b">>"
+    result = type_utils.varbytehex_recv(data, 2, len(hex_payload))
+    assert result == expected
+    assert isinstance(result, bytes)

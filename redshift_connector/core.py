@@ -92,6 +92,7 @@ from redshift_connector.utils import (
     time_recv_binary,
     timetz_in,
     timetz_recv_binary,
+    varbyte_recv_binary,
     varbytehex_recv,
     walk_array,
 )
@@ -937,7 +938,9 @@ class Connection:
             self.redshift_types[RedshiftOID.REAL_ARRAY] = (FC_BINARY, array_recv_binary)  # FLOAT4[]
             self.redshift_types[RedshiftOID.OID_ARRAY] = (FC_BINARY, array_recv_binary)  # OID[]
             self.redshift_types[RedshiftOID.ACLITEM_ARRAY] = (FC_BINARY, array_recv_binary)  # ACLITEM[]
-            self.redshift_types[RedshiftOID.VARBYTE] = (FC_TEXT, text_recv)  # VARBYTE
+            # The server sends VARBYTE as raw bytes on the binary protocol whatever
+            # format code is requested, so ask for binary and return bytes as-is.
+            self.redshift_types[RedshiftOID.VARBYTE] = (FC_BINARY, varbyte_recv_binary)  # VARBYTE
 
             if self.numeric_to_float:
                 _logger.debug("Enabling numeric to float binary conversion function")

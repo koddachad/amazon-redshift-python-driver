@@ -42,5 +42,6 @@ from .type_utils import (
     time_recv_binary,
     timetz_in,
     timetz_recv_binary,
+    varbyte_recv_binary,
     varbytehex_recv,
 )
